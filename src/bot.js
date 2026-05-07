@@ -10,16 +10,17 @@ const COINGECKO_API_KEY = process.env.COINGECKO_API_KEY || '';
 const STATE_FILE        = './bot2-state.json';
 
 const CONFIG = {
-  MAX_POSITIONS:    parseInt(process.env.MAX_POSITIONS    || '4'),
-  TRADE_SIZE_SOL:   parseFloat(process.env.TRADE_SIZE_SOL || '0.2'),
-  MIN_RESERVE_SOL:  parseFloat(process.env.MIN_RESERVE    || '0.05'),
-  STOP_LOSS:        parseFloat(process.env.STOP_LOSS      || '0.25'),
-  BUY_THRESHOLD:    parseFloat(process.env.BUY_THRESHOLD  || '0.015'),
-  SCAN_INTERVAL_MS: parseInt(process.env.SCAN_INTERVAL_MS || '60000'),
-  MOMENTUM_EXIT:    parseFloat(process.env.MOMENTUM_EXIT  || '-0.005'),
-  MIN_VOLUME_USD:   parseFloat(process.env.MIN_VOLUME_USD || '50000'),
-  TRAILING_ARM_PCT: parseFloat(process.env.TRAILING_ARM   || '0.10'),
-  MIN_HOLD_MS:      parseInt(process.env.MIN_HOLD_MS      || String(4 * 60 * 60 * 1000)),
+  MAX_POSITIONS:      parseInt(process.env.MAX_POSITIONS    || '4'),
+  TRADE_SIZE_SOL:     parseFloat(process.env.TRADE_SIZE_SOL || '0.2'),
+  MIN_RESERVE_SOL:    parseFloat(process.env.MIN_RESERVE    || '0.05'),
+  STOP_LOSS:          parseFloat(process.env.STOP_LOSS      || '0.25'),
+  BUY_THRESHOLD:      parseFloat(process.env.BUY_THRESHOLD  || '0.015'),
+  SCAN_INTERVAL_MS:   parseInt(process.env.SCAN_INTERVAL_MS || '60000'),
+  MOMENTUM_EXIT:      parseFloat(process.env.MOMENTUM_EXIT  || '-0.005'),
+  MIN_VOLUME_USD:     parseFloat(process.env.MIN_VOLUME_USD || '50000'),
+  TRAILING_ARM_PCT:   parseFloat(process.env.TRAILING_ARM   || '0.10'),  // trailing stop 10%
+  MIN_HOLD_MS:        parseInt(process.env.MIN_HOLD_MS      || String(4 * 60 * 60 * 1000)),
+  VOL_DROP_THRESHOLD: parseFloat(process.env.VOL_DROP_THRESHOLD || '0.30'), // exit when volume drops 30% from entry
 };
 
 // Auto-discovery config
@@ -343,11 +344,23 @@ async function evaluateStrategy(connection, wallet) {
     if (sig.priceSol > (pos.peakPrice || 0)) state.positions[token].peakPrice = sig.priceSol;
     const heldMs = Date.now() - new Date(pos.openedAt).getTime();
     const minHoldMet = heldMs >= CONFIG.MIN_HOLD_MS;
+
+    // Volume drop from entry — primary exit signal
+    const curVolume = sig.volume24h || 0;
+    const volDrop = pos.entryVolume > 0 ? (pos.entryVolume - curVolume) / pos.entryVolume : 0;
+
     let exitReason = null;
-    if (pctFromEntry < -CONFIG.STOP_LOSS) exitReason = 'stop-loss (' + (pctFromEntry*100).toFixed(1) + '%)';
-    else if (minHoldMet && pctFromEntry > CONFIG.TRAILING_ARM_PCT && pctFromPeak < -0.10) exitReason = 'trailing stop (' + (pctFromPeak*100).toFixed(1) + '% from peak)';
-    else if (minHoldMet && sig.score < CONFIG.MOMENTUM_EXIT && !sig.blocked) exitReason = 'momentum died';
-    else if (minHoldMet && sig.score === 0 && pctFromEntry < -0.02) exitReason = 'no momentum + losing (' + (pctFromEntry*100).toFixed(1) + '%)';
+    if (pctFromEntry < -CONFIG.STOP_LOSS) {
+      exitReason = 'stop-loss (' + (pctFromEntry*100).toFixed(1) + '%)';
+    } else if (pctFromPeak < -CONFIG.TRAILING_ARM_PCT) {
+      exitReason = 'trailing stop (' + (pctFromPeak*100).toFixed(1) + '% from peak)';
+    } else if (volDrop >= CONFIG.VOL_DROP_THRESHOLD && heldMs >= 60*60*1000) {
+      exitReason = 'volume exhausted (' + (volDrop*100).toFixed(0) + '% drop from entry)';
+    } else if (minHoldMet && sig.score < CONFIG.MOMENTUM_EXIT && !sig.blocked) {
+      exitReason = 'momentum died';
+    } else if (minHoldMet && sig.score === 0 && pctFromEntry < -0.02) {
+      exitReason = 'no momentum + losing (' + (pctFromEntry*100).toFixed(1) + '%)';
+    }
     if (exitReason) { log('SELL ' + token + ': ' + exitReason); await executeSell(connection, wallet, token, pos, sig); }
     else log('Holding ' + token + '. P&L: ' + (pctFromEntry>=0?'+':'') + (pctFromEntry*100).toFixed(2) + '% | mom=' + (sig.momentum*100).toFixed(2) + '%');
   }
@@ -377,7 +390,7 @@ async function executeBuy(connection, wallet, tokenName, tokenData) {
     const onChain = await getTokenBalance(connection, wallet.publicKey, info.mint, info.decimals);
     const tokensReceived = onChain > 0 ? onChain : parseFloat(quote.outAmount) / Math.pow(10, info.decimals);
     state.currentSol = await getSolBalance(connection, wallet.publicKey);
-    state.positions[tokenName] = { amount: tokensReceived, entryPrice: tokenData.priceSol, entryPriceUsd: tokenData.tokenUsd, peakPrice: tokenData.priceSol, solSpent: tradeSOL, openedAt: new Date().toISOString() };
+    state.positions[tokenName] = { amount: tokensReceived, entryPrice: tokenData.priceSol, entryPriceUsd: tokenData.tokenUsd, peakPrice: tokenData.priceSol, solSpent: tradeSOL, openedAt: new Date().toISOString(), entryVolume: tokenData.volume24h || 0 };
     state.trades.unshift({ type: 'BUY', token: tokenName, solSpent: tradeSOL, tokensReceived, price: tokenData.priceSol, priceUsd: tokenData.tokenUsd, score: tokenData.score, sig, time: new Date().toISOString() });
     if (state.trades.length > 100) state.trades.pop();
     log('Bought ' + tokenName + ' ' + tokensReceived.toFixed(2) + ' tokens. Tx: ' + sig);
