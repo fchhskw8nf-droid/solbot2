@@ -142,7 +142,7 @@ function getVolatility(token) {
 
 function buildMomentumScore(opts) {
   if (opts.volume24h < CONFIG.MIN_VOLUME_USD) return { score: 0, blocked: 'low volume ($' + Math.round(opts.volume24h/1000) + 'k)' };
-  if (opts.volatility < 0.005) return { score: 0, blocked: 'low volatility' };
+  if (opts.volatility < 0.001) return { score: 0, blocked: 'low volatility' };
   if (opts.momentum <= 0) return { score: 0, blocked: 'no momentum' };
   let score = opts.momentum * 0.5;
   if (opts.acceleration > 0.005) score *= 1.5;
@@ -157,102 +157,45 @@ function buildMomentumScore(opts) {
 async function scanForNewTokens() {
   try {
     log('Auto-discovery scan running...');
+    const res = await fetch('https://api.dexscreener.com/latest/dex/search?q=solana', { timeout: 15000 });
+    const data = await res.json();
+    if (!data.pairs) return;
     const now = Date.now();
-    const SKIP = new Set(['USDC','USDT','SOL','WSOL','BTC','ETH','WBTC','WETH','RAY','JUP','ORCA','MNGO']);
-    let pairs = [];
-
-    // Strategy 1: DEX Screener trending Solana tokens
-    try {
-      const trendRes = await fetch('https://api.dexscreener.com/token-boosts/top/v1', { timeout: 12000 });
-      const trendData = await trendRes.json();
-      // token-boosts returns array of { tokenAddress, chainId, ... }
-      const solMints = (Array.isArray(trendData) ? trendData : [])
-        .filter(t => t.chainId === 'solana')
-        .map(t => t.tokenAddress)
-        .filter(Boolean)
-        .slice(0, 20);
-      if (solMints.length > 0) {
-        // Fetch pair data for these mints
-        for (const mint of solMints.slice(0, 10)) {
-          try {
-            const pRes = await fetch('https://api.dexscreener.com/latest/dex/tokens/' + mint, { timeout: 10000 });
-            const pData = await pRes.json();
-            if (pData.pairs) pairs.push(...pData.pairs);
-            await new Promise(r => setTimeout(r, 300));
-          } catch(e) {}
-        }
-      }
-    } catch(e) { log('Discovery: token-boosts failed: ' + e.message); }
-
-    // Strategy 2: Fallback — search for pumping Solana meme tokens
-    if (pairs.length === 0) {
-      try {
-        const searchRes = await fetch('https://api.dexscreener.com/latest/dex/search?q=pump%20solana', { timeout: 12000 });
-        const searchData = await searchRes.json();
-        if (searchData.pairs) pairs.push(...searchData.pairs);
-      } catch(e) {}
-    }
-
-    if (pairs.length === 0) { log('Discovery: no pairs returned'); return; }
-
     const candidates = [];
-    for (const pair of pairs) {
+    const SKIP = ['USDC','USDT','SOL','WSOL','BTC','ETH','WBTC','WETH'];
+    for (const pair of data.pairs) {
       try {
         if (pair.chainId !== 'solana') continue;
         const symbol = (pair.baseToken && pair.baseToken.symbol || '').toUpperCase().replace(/[^A-Z0-9]/g,'');
         const mint = pair.baseToken && pair.baseToken.address;
         if (!symbol || !mint || symbol.length > 12) continue;
         if (state.watchlist[symbol] || autoAddedTokens[symbol]) continue;
-        if (SKIP.has(symbol)) continue;
-
-        const volume24h  = (pair.volume && pair.volume.h24)           || 0;
-        const change24h  = (pair.priceChange && pair.priceChange.h24) || 0;
-        const liquidity  = (pair.liquidity && pair.liquidity.usd)     || 0;
-        const priceUsd   = parseFloat(pair.priceUsd || '0');
-
-        // Filters — age check is optional (pairCreatedAt often 0 for legit tokens)
-        if (volume24h  < DISC.MIN_VOLUME)    continue;
-        if (change24h  < DISC.MIN_CHANGE)    continue;
-        if (liquidity  < DISC.MIN_LIQUIDITY) continue;
-        if (priceUsd   <= 0)                 continue;
-
-        // Only apply age filter if pairCreatedAt is a real value (not 0/null)
-        if (pair.pairCreatedAt && pair.pairCreatedAt > 1000000) {
-          const ageH = (now - pair.pairCreatedAt) / 3600000;
-          if (ageH > DISC.MAX_AGE_H) continue;
-        }
-
-        candidates.push({ symbol, mint, volume24h, change24h, liquidity, priceUsd });
+        if (SKIP.includes(symbol)) continue;
+        const volume24h = (pair.volume && pair.volume.h24) || 0;
+        const change24h = (pair.priceChange && pair.priceChange.h24) || 0;
+        const liquidity = (pair.liquidity && pair.liquidity.usd) || 0;
+        const ageH = (now - (pair.pairCreatedAt || 0)) / 3600000;
+        if (volume24h < DISC.MIN_VOLUME) continue;
+        if (change24h < DISC.MIN_CHANGE) continue;
+        if (liquidity < DISC.MIN_LIQUIDITY) continue;
+        if (ageH > DISC.MAX_AGE_H) continue;
+        candidates.push({ symbol, mint, volume24h, change24h, liquidity, ageH });
       } catch(e) {}
     }
-
-    // Deduplicate by mint address
-    const seen = new Set();
-    const unique = candidates.filter(c => { if (seen.has(c.mint)) return false; seen.add(c.mint); return true; });
-    unique.sort((a,b) => (b.volume24h * b.change24h) - (a.volume24h * a.change24h));
-
-    log('Discovery: ' + pairs.length + ' pairs scanned, ' + unique.length + ' candidates found');
-
+    candidates.sort((a,b) => (b.volume24h*b.change24h) - (a.volume24h*a.change24h));
     const slots = DISC.MAX_TOKENS - Object.keys(autoAddedTokens).length;
-    const toAdd = unique.slice(0, Math.min(slots, 2));
-
+    const toAdd = candidates.slice(0, Math.min(slots, 2));
     for (const t of toAdd) {
-      log('Auto-discovered: ' + t.symbol + ' +' + t.change24h.toFixed(1) + '% vol=$' + Math.round(t.volume24h/1000) + 'k liq=$' + Math.round(t.liquidity/1000) + 'k $' + t.priceUsd.toFixed(6));
+      const msg = 'Auto-discovered: ' + t.symbol + ' +' + t.change24h.toFixed(1) + '% vol=$' + Math.round(t.volume24h/1000) + 'k liq=$' + Math.round(t.liquidity/1000) + 'k age=' + t.ageH.toFixed(1) + 'h';
+      log(msg);
       state.watchlist[t.symbol] = { mint: t.mint, decimals: 6, cgId: null };
       autoAddedTokens[t.symbol] = { addedAt: now, mint: t.mint };
       if (!state.autoDiscovered) state.autoDiscovered = [];
       state.autoDiscovered.unshift({ symbol: t.symbol, time: new Date().toISOString(), change24h: t.change24h, volume24h: t.volume24h });
       if (state.autoDiscovered.length > 20) state.autoDiscovered.pop();
     }
-
-    if (toAdd.length > 0) {
-      log('Added to watchlist: ' + toAdd.map(t=>t.symbol).join(', '));
-      await saveState();
-    } else {
-      log('Discovery: no new tokens met criteria');
-    }
-
-    // Remove stale auto tokens (no position held after 24h)
+    if (toAdd.length > 0) { log('Added to watchlist: ' + toAdd.map(t=>t.symbol).join(', ')); await saveState(); }
+    // Remove stale auto tokens (no position after 24h)
     for (const [sym, info] of Object.entries(autoAddedTokens)) {
       if ((now - info.addedAt) / 3600000 > 24 && !state.positions[sym]) {
         log('Removing stale auto-token: ' + sym);
@@ -261,7 +204,7 @@ async function scanForNewTokens() {
         await saveState();
       }
     }
-  } catch(e) { log('Discovery error: ' + e.message); addError('Discovery: ' + e.message); }
+  } catch(e) { log('Discovery error: ' + e.message); }
 }
 
 // ── Solana Helpers ────────────────────────────────────────────────────────────
@@ -352,13 +295,20 @@ async function evaluateStrategy(connection, wallet) {
           }
         } catch(e) {}
       }
-      if (!tokenUsd && info.mint) {
+      // Always fetch DEX Screener: for price fallback AND to get volume/change24h
+      // (CoinGecko simple/price doesn't return volume)
+      if (!tokenUsd || volume24h === 0) {
         try {
           const dsRes = await fetch('https://api.dexscreener.com/latest/dex/tokens/' + info.mint, { timeout: 10000 });
           const dsData = await dsRes.json();
           if (dsData.pairs && dsData.pairs.length > 0) {
             const pair = dsData.pairs.sort((a,b) => ((b.liquidity&&b.liquidity.usd)||0) - ((a.liquidity&&a.liquidity.usd)||0))[0];
-            if (pair.priceUsd) { tokenUsd = parseFloat(pair.priceUsd); volume24h = (pair.volume&&pair.volume.h24)||0; change24h = (pair.priceChange&&pair.priceChange.h24)||0; }
+            if (pair.priceUsd) {
+              if (!tokenUsd) tokenUsd = parseFloat(pair.priceUsd);
+              // Always take volume + change from DEX Screener — more reliable than CoinGecko simple
+              if (volume24h === 0) volume24h = (pair.volume&&pair.volume.h24)||0;
+              if (change24h === 0) change24h = (pair.priceChange&&pair.priceChange.h24)||0;
+            }
           }
         } catch(e) {}
       }
@@ -478,6 +428,55 @@ async function executeSell(connection, wallet, tokenName, pos, tokenData) {
   } catch(e) { log('Sell failed: ' + e.message); addError(e.message); }
 }
 
+
+// ── Bootstrap Price History ───────────────────────────────────────────────────
+// Pre-populate price history on startup so momentum/volatility signals are
+// valid from the first scan instead of waiting 6+ minutes to warm up.
+async function bootstrapPriceHistory() {
+  log('Bootstrapping price history...');
+  let solUsd = 150;
+  try {
+    const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd', { timeout: 10000 });
+    const d = await r.json();
+    if (d.solana && d.solana.usd) solUsd = d.solana.usd;
+  } catch(e) {}
+
+  const tokens = Object.keys(state.watchlist);
+  for (let i = 0; i < tokens.length; i++) {
+    const name = tokens[i];
+    const info = state.watchlist[name];
+    if (!info || !info.mint) continue;
+    try {
+      const res = await fetch('https://api.dexscreener.com/latest/dex/tokens/' + info.mint, { timeout: 12000 });
+      const data = await res.json();
+      if (!data.pairs || data.pairs.length === 0) continue;
+      const pair = data.pairs.sort(function(a,b){
+        return ((b.liquidity&&b.liquidity.usd)||0) - ((a.liquidity&&a.liquidity.usd)||0);
+      })[0];
+      const curUsd = parseFloat(pair.priceUsd || '0');
+      if (!curUsd) continue;
+      const change24h = (pair.priceChange && pair.priceChange.h24) || 0;
+      const change1h  = (pair.priceChange && pair.priceChange.h1)  || 0;
+      const price24hAgo = curUsd / (1 + change24h / 100);
+      const price1hAgo  = curUsd / (1 + change1h  / 100);
+      // Synthesize 20 price points spanning last 24h
+      state.priceHistory[name] = [];
+      const now = Date.now();
+      for (let j = 0; j < 19; j++) {
+        const t = j / 18;
+        const synthUsd = price24hAgo + (price1hAgo - price24hAgo) * t;
+        state.priceHistory[name].push({ price: synthUsd / solUsd, time: now - (19 - j) * 7200000 });
+      }
+      state.priceHistory[name].push({ price: curUsd / solUsd, time: now });
+      log('Bootstrap ' + name + ': 20 pts, mom=' + (getMomentum(name)*100).toFixed(2) + '% vol=' + (getVolatility(name)*100).toFixed(3) + '%');
+      if (i < tokens.length - 1) await new Promise(r => setTimeout(r, 600));
+    } catch(e) {
+      log('Bootstrap failed for ' + name + ': ' + e.message);
+    }
+  }
+  log('Bootstrap complete.');
+}
+
 async function main() {
   if (!PRIVATE_KEY) { console.error('PRIVATE_KEY not set'); process.exit(1); }
   await loadState();
@@ -506,6 +505,7 @@ async function main() {
   }
   log('Positions after startup scan: ' + Object.keys(state.positions).join(', ') || 'none');
   await saveState();
+  await bootstrapPriceHistory();
   let loopCount = 0;
   while (true) {
     try {
