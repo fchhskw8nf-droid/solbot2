@@ -145,10 +145,20 @@ async function getSolBalance(connection, publicKey) {
 
 async function getTokenBalance(connection, walletPubkey, tokenMint, decimals) {
   try {
+    // Try standard SPL token first
     const ata = await getAssociatedTokenAddress(new PublicKey(tokenMint), walletPubkey);
     const account = await getAccount(connection, ata);
     return Number(account.amount) / Math.pow(10, decimals);
-  } catch(e) { return 0; }
+  } catch(e) {
+    try {
+      // Fallback: use getParsedTokenAccountsByOwner which works for both SPL and Token-2022
+      const accounts = await connection.getParsedTokenAccountsByOwner(walletPubkey, { mint: new PublicKey(tokenMint) });
+      if (accounts.value.length > 0) {
+        return accounts.value[0].account.data.parsed.info.tokenAmount.uiAmount || 0;
+      }
+    } catch(e2) {}
+    return 0;
+  }
 }
 
 async function getSwapQuote(inputMint, outputMint, amount, slippageBps) {
