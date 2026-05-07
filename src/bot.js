@@ -323,6 +323,8 @@ async function main() {
   state.wallet = wallet.publicKey.toString();
   state.running = true;
   if (!state.positions) state.positions = {};
+  // Always merge DEFAULT_TOKENS so newly added tokens always appear
+  state.watchlist = Object.assign({}, state.watchlist, DEFAULT_TOKENS);
   log('Momentum Bot v2 started');
   log('Watching ' + Object.keys(state.watchlist).length + ' tokens | ' + CONFIG.MAX_POSITIONS + ' max positions');
   log('Wallet: ' + wallet.publicKey.toString());
