@@ -34,7 +34,7 @@ const DEFAULT_TOKENS = {
   BONK:     { mint: 'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263', decimals: 5, cgId: 'bonk' },
   WIF:      { mint: 'EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm', decimals: 6, cgId: 'dogwifcoin' },
   TROLL:    { mint: '5UUH9RTDiSpq6HKS6bp4NdU9PNJpXRXuiw6ShBTBhgH2', decimals: 6, cgId: 'troll-2' },
-  LIMINAL:  { mint: 'CYSVBkXuuDaZ4gNqzQPaWuoxejr6ZgTKLSJeGNdjpump', decimals: 6, cgId: 'liminal-2' },
+  LIMINAL:  { mint: 'CYSVBkXuuDaZ4gNqzQPaWuoxejr6ZgTKLSJeGNdjpump', decimals: 6, cgId: null },
 };
 
 let state = {
@@ -195,32 +195,71 @@ async function evaluateStrategy(connection, wallet) {
   const tokenData = {};
   const watchTokens = Object.keys(state.watchlist);
 
+  // Get SOL price once
+  let globalSolUsd = 100;
+  try {
+    const cgHeaders = COINGECKO_API_KEY ? { 'x-cg-demo-api-key': COINGECKO_API_KEY } : {};
+    const solRes = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd', { timeout: 10000, headers: cgHeaders });
+    const solData = await solRes.json();
+    if (solData.solana && solData.solana.usd) globalSolUsd = solData.solana.usd;
+  } catch(e) {}
+
   for (let i = 0; i < watchTokens.length; i++) {
     const name = watchTokens[i];
     const info = state.watchlist[name];
-    if (!info || !info.cgId) continue;
+    if (!info) continue;
     try {
       const cgHeaders = COINGECKO_API_KEY ? { 'x-cg-demo-api-key': COINGECKO_API_KEY } : {};
-      const priceRes = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=' + info.cgId + ',solana&vs_currencies=usd', { timeout: 10000, headers: cgHeaders });
-      const priceData = await priceRes.json();
-      const tokenUsd = priceData[info.cgId] && priceData[info.cgId].usd ? priceData[info.cgId].usd : null;
-      const solUsd = priceData['solana'] && priceData['solana'].usd ? priceData['solana'].usd : null;
-      if (!tokenUsd || !solUsd) continue;
+      let tokenUsd = null, solUsd = globalSolUsd, volume24h = 0, change24h = 0, sentimentScore = null;
+
+      // Try CoinGecko first
+      if (info.cgId) {
+        try {
+          const priceRes = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=' + info.cgId + ',solana&vs_currencies=usd', { timeout: 10000, headers: cgHeaders });
+          const priceData = await priceRes.json();
+          if (priceData[info.cgId] && priceData[info.cgId].usd) {
+            tokenUsd = priceData[info.cgId].usd;
+            if (priceData.solana && priceData.solana.usd) solUsd = priceData.solana.usd;
+          }
+        } catch(e) {}
+      }
+
+      // Fallback to DEX Screener if CoinGecko failed or no cgId
+      if (!tokenUsd && info.mint) {
+        try {
+          const dsRes = await fetch('https://api.dexscreener.com/latest/dex/tokens/' + info.mint, { timeout: 10000 });
+          const dsData = await dsRes.json();
+          if (dsData.pairs && dsData.pairs.length > 0) {
+            const pair = dsData.pairs.sort((a,b) => (b.liquidity?.usd||0) - (a.liquidity?.usd||0))[0];
+            if (pair.priceUsd) {
+              tokenUsd = parseFloat(pair.priceUsd);
+              volume24h = pair.volume?.h24 || 0;
+              change24h = pair.priceChange?.h24 || 0;
+            }
+          }
+        } catch(e) {}
+      }
+
+      if (!tokenUsd || !solUsd) { if (i > 0) await new Promise(r => setTimeout(r, 800)); continue; }
+
       const priceSol = tokenUsd / solUsd;
       updatePriceHistory(name, priceSol);
-      if (i > 0) await new Promise(r => setTimeout(r, 1200));
-      let volume24h = 0, change24h = 0, change1h = 0, sentimentScore = null;
-      try {
-        const cgRes = await fetch('https://api.coingecko.com/api/v3/coins/' + info.cgId + '?localization=false&tickers=false&community_data=true&developer_data=false', { timeout: 10000, headers: cgHeaders });
-        const cgData = await cgRes.json();
-        if (cgData.market_data) {
-          volume24h = cgData.market_data.total_volume && cgData.market_data.total_volume.usd ? cgData.market_data.total_volume.usd : 0;
-          change24h = cgData.market_data.price_change_percentage_24h || 0;
-          change1h = (cgData.market_data.price_change_percentage_1h_in_currency && cgData.market_data.price_change_percentage_1h_in_currency.usd) || 0;
-          const upPct = cgData.sentiment_votes_up_percentage || 50;
-          sentimentScore = ((upPct-(100-upPct))/100)*0.4 + Math.tanh((change1h*2+change24h*0.5)/10)*0.6;
-        }
-      } catch(e) {}
+      if (i > 0) await new Promise(r => setTimeout(r, 800));
+
+      // Get extra CoinGecko data if available
+      if (info.cgId && tokenUsd) {
+        try {
+          const cgRes = await fetch('https://api.coingecko.com/api/v3/coins/' + info.cgId + '?localization=false&tickers=false&community_data=true&developer_data=false', { timeout: 10000, headers: cgHeaders });
+          const cgData = await cgRes.json();
+          if (cgData.market_data) {
+            volume24h = cgData.market_data.total_volume?.usd || volume24h;
+            change24h = cgData.market_data.price_change_percentage_24h || change24h;
+            const change1h = cgData.market_data.price_change_percentage_1h_in_currency?.usd || 0;
+            const upPct = cgData.sentiment_votes_up_percentage || 50;
+            sentimentScore = ((upPct-(100-upPct))/100)*0.4 + Math.tanh((change1h*2+change24h*0.5)/10)*0.6;
+          }
+        } catch(e) {}
+      }
       const momentum = getMomentum(name);
       const acceleration = getMomentumAcceleration(name);
       const volatility = getVolatility(name);
