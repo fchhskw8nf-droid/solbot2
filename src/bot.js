@@ -33,8 +33,8 @@ const DEFAULT_TOKENS = {
   PENGU:    { mint: '2zMMhcVQEXDtdE6vsFS7S7D5oUodfJHE8vd1gnBouauv', decimals: 6, cgId: 'pudgy-penguins' },
   BONK:     { mint: 'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263', decimals: 5, cgId: 'bonk' },
   WIF:      { mint: 'EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm', decimals: 6, cgId: 'dogwifcoin' },
-  TROLL:    { mint: '9vc9aqBMWqsJBsYFbMzMCCFBP7SRFXARFLR9tHT5pump', decimals: 6, cgId: 'troll-2' },
-  LIMINAL:  { mint: '7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU', decimals: 6, cgId: 'liminal-2' },
+  TROLL:    { mint: '5UUH9RTDiSpq6HKS6bp4NdU9PNJpXRXuiw6ShBTBhgH2', decimals: 6, cgId: 'troll-2' },
+  LIMINAL:  { mint: 'CYSVBkXuuDaZ4gNqzQPaWuoxejr6ZgTKLSJeGNdjpump', decimals: 6, cgId: 'liminal-2' },
 };
 
 let state = {
