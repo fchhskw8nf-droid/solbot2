@@ -57,6 +57,7 @@ let state = {
 };
 
 let autoAddedTokens = {};
+let warmupScansRemaining = 0; // suppresses buys after bootstrap until real data blends in
 
 // ── Persistence ───────────────────────────────────────────────────────────────
 async function saveState() {
@@ -295,8 +296,6 @@ async function evaluateStrategy(connection, wallet) {
           }
         } catch(e) {}
       }
-      // Always fetch DEX Screener: for price fallback AND to get volume/change24h
-      // (CoinGecko simple/price doesn't return volume)
       if (!tokenUsd || volume24h === 0) {
         try {
           const dsRes = await fetch('https://api.dexscreener.com/latest/dex/tokens/' + info.mint, { timeout: 10000 });
@@ -305,7 +304,6 @@ async function evaluateStrategy(connection, wallet) {
             const pair = dsData.pairs.sort((a,b) => ((b.liquidity&&b.liquidity.usd)||0) - ((a.liquidity&&a.liquidity.usd)||0))[0];
             if (pair.priceUsd) {
               if (!tokenUsd) tokenUsd = parseFloat(pair.priceUsd);
-              // Always take volume + change from DEX Screener — more reliable than CoinGecko simple
               if (volume24h === 0) volume24h = (pair.volume&&pair.volume.h24)||0;
               if (change24h === 0) change24h = (pair.priceChange&&pair.priceChange.h24)||0;
             }
@@ -374,7 +372,10 @@ async function evaluateStrategy(connection, wallet) {
 
   const openCount = Object.keys(state.positions).length;
   const availableSlots = CONFIG.MAX_POSITIONS - openCount;
-  if (availableSlots > 0 && state.currentSol > CONFIG.MIN_RESERVE_SOL + CONFIG.TRADE_SIZE_SOL) {
+  if (warmupScansRemaining > 0) {
+    warmupScansRemaining--;
+    log('Warmup: ' + warmupScansRemaining + ' scans remaining before buys enabled (letting price history stabilize)');
+  } else if (availableSlots > 0 && state.currentSol > CONFIG.MIN_RESERVE_SOL + CONFIG.TRADE_SIZE_SOL) {
     const candidates = Object.entries(tokenData).filter(([n,d]) => !state.positions[n] && !d.blocked && d.score >= CONFIG.BUY_THRESHOLD).sort((a,b) => b[1].score - a[1].score).slice(0, availableSlots);
     if (candidates.length > 0) { for (const [n,d] of candidates) { if (state.currentSol < CONFIG.MIN_RESERVE_SOL + CONFIG.TRADE_SIZE_SOL) break; log('BUY ' + n + ' score=' + d.score.toFixed(5)); await executeBuy(connection, wallet, n, d); } }
     else log('No momentum signals. Watching...');
@@ -430,8 +431,6 @@ async function executeSell(connection, wallet, tokenName, pos, tokenData) {
 
 
 // ── Bootstrap Price History ───────────────────────────────────────────────────
-// Pre-populate price history on startup so momentum/volatility signals are
-// valid from the first scan instead of waiting 6+ minutes to warm up.
 async function bootstrapPriceHistory() {
   log('Bootstrapping price history...');
   let solUsd = 150;
@@ -456,25 +455,32 @@ async function bootstrapPriceHistory() {
       const curUsd = parseFloat(pair.priceUsd || '0');
       if (!curUsd) continue;
       const change24h = (pair.priceChange && pair.priceChange.h24) || 0;
-      const change1h  = (pair.priceChange && pair.priceChange.h1)  || 0;
+      const change6h  = (pair.priceChange && pair.priceChange.h6)  || change24h / 4;
+      // Synthesize 20 price points: spread evenly, keeping current price as LAST point
+      // Use 6h change for the recent half to avoid inflating momentum
       const price24hAgo = curUsd / (1 + change24h / 100);
-      const price1hAgo  = curUsd / (1 + change1h  / 100);
-      // Synthesize 20 price points spanning last 24h
+      const price6hAgo  = curUsd / (1 + change6h  / 100);
       state.priceHistory[name] = [];
       const now = Date.now();
-      for (let j = 0; j < 19; j++) {
-        const t = j / 18;
-        const synthUsd = price24hAgo + (price1hAgo - price24hAgo) * t;
+      for (let j = 0; j < 15; j++) {
+        const t = j / 14;
+        const synthUsd = price24hAgo + (price6hAgo - price24hAgo) * t;
         state.priceHistory[name].push({ price: synthUsd / solUsd, time: now - (19 - j) * 7200000 });
       }
-      state.priceHistory[name].push({ price: curUsd / solUsd, time: now });
+      // Last 5 points: 6h ago → now (tighter window = realistic recent momentum)
+      for (let j = 0; j < 5; j++) {
+        const t = j / 4;
+        const synthUsd = price6hAgo + (curUsd - price6hAgo) * t;
+        state.priceHistory[name].push({ price: synthUsd / solUsd, time: now - (4 - j) * 3600000 });
+      }
       log('Bootstrap ' + name + ': 20 pts, mom=' + (getMomentum(name)*100).toFixed(2) + '% vol=' + (getVolatility(name)*100).toFixed(3) + '%');
       if (i < tokens.length - 1) await new Promise(r => setTimeout(r, 600));
     } catch(e) {
       log('Bootstrap failed for ' + name + ': ' + e.message);
     }
   }
-  log('Bootstrap complete.');
+  log('Bootstrap complete — 6 scan warmup before new buys enabled.');
+  warmupScansRemaining = 6;
 }
 
 async function main() {
