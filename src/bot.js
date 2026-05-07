@@ -242,7 +242,12 @@ async function evaluateStrategy(connection, wallet) {
     let exitReason = null;
     if (pctFromEntry < -CONFIG.STOP_LOSS) exitReason = 'stop-loss (' + (pctFromEntry*100).toFixed(1) + '%)';
     else if (pctFromEntry > CONFIG.TRAILING_ARM_PCT && pctFromPeak < -0.10) exitReason = 'trailing stop (' + (pctFromPeak*100).toFixed(1) + '% from peak)';
+    // Exit if momentum is dead (score=0 AND negative P&L AND held for more than 10 minutes)
     else if (sig.score < CONFIG.MOMENTUM_EXIT && !sig.blocked) exitReason = 'momentum died';
+    else if (sig.score === 0 && pctFromEntry < -0.02) {
+      const heldMs = Date.now() - new Date(pos.openedAt).getTime();
+      if (heldMs > 10 * 60 * 1000) exitReason = 'no momentum + losing (' + (pctFromEntry*100).toFixed(1) + '%)';
+    }
     if (exitReason) { log('🔴 SELL ' + token + ': ' + exitReason); await executeSell(connection, wallet, token, pos, sig); }
     else log('Holding ' + token + '. P&L: ' + (pctFromEntry>=0?'+':'') + (pctFromEntry*100).toFixed(2) + '% | mom=' + (sig.momentum*100).toFixed(2) + '%');
   }
@@ -269,12 +274,18 @@ async function executeBuy(connection, wallet, tokenName, tokenData) {
     if (!quote) return;
     const sig = await executeSwap(connection, wallet, quote);
     if (!sig) return;
-    const tokensReceived = parseFloat(quote.outAmount) / Math.pow(10, info.decimals);
+
+    // Wait 5 seconds for token account to register on-chain
+    await new Promise(r => setTimeout(r, 5000));
+
+    const onChain = await getTokenBalance(connection, wallet.publicKey, info.mint, info.decimals);
+    const tokensReceived = onChain > 0 ? onChain : parseFloat(quote.outAmount) / Math.pow(10, info.decimals);
+
     state.currentSol = await getSolBalance(connection, wallet.publicKey);
     state.positions[tokenName] = { amount: tokensReceived, entryPrice: tokenData.priceSol, entryPriceUsd: tokenData.tokenUsd, peakPrice: tokenData.priceSol, solSpent: tradeSOL, openedAt: new Date().toISOString() };
     state.trades.unshift({ type: 'BUY', token: tokenName, solSpent: tradeSOL, tokensReceived, price: tokenData.priceSol, priceUsd: tokenData.tokenUsd, score: tokenData.score, sig, time: new Date().toISOString() });
     if (state.trades.length > 100) state.trades.pop();
-    log('✅ Bought ' + tokenName + '. Tx: ' + sig);
+    log('✅ Bought ' + tokenName + ' ' + tokensReceived.toFixed(2) + ' tokens. Tx: ' + sig);
     await saveState();
   } catch(e) { log('Buy failed: ' + e.message); addError(e.message); }
 }
@@ -316,6 +327,27 @@ async function main() {
   state.currentSol = await getSolBalance(connection, wallet.publicKey);
   if (!state.startingSol) state.startingSol = state.currentSol;
   log('Balance: ' + state.currentSol.toFixed(4) + ' SOL');
+
+  // Scan all watchlist tokens for untracked on-chain positions
+  log('Checking on-chain balances for untracked positions...');
+  for (const [name, info] of Object.entries(state.watchlist)) {
+    if (state.positions[name]) continue; // already tracked
+    try {
+      const onChain = await getTokenBalance(connection, wallet.publicKey, info.mint, info.decimals);
+      if (onChain > 0.000001) {
+        log('Found untracked position: ' + name + ' (' + onChain.toFixed(4) + ' tokens) — adding to positions');
+        state.positions[name] = {
+          amount: onChain,
+          entryPrice: 0, // unknown entry price
+          entryPriceUsd: 0,
+          peakPrice: 0,
+          solSpent: CONFIG.TRADE_SIZE_SOL, // assume standard trade size
+          openedAt: new Date().toISOString(),
+        };
+      }
+    } catch(e) {}
+  }
+  log('Positions after startup scan: ' + Object.keys(state.positions).join(', ') || 'none');
   await saveState();
   while (true) {
     try { await evaluateStrategy(connection, wallet); }
