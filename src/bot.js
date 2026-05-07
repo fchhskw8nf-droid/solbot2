@@ -19,6 +19,16 @@ const CONFIG = {
   MOMENTUM_EXIT:    parseFloat(process.env.MOMENTUM_EXIT  || '-0.005'),
   MIN_VOLUME_USD:   parseFloat(process.env.MIN_VOLUME_USD || '50000'),
   TRAILING_ARM_PCT: parseFloat(process.env.TRAILING_ARM   || '0.10'),
+  MIN_HOLD_MS:      parseInt(process.env.MIN_HOLD_MS      || String(4 * 60 * 60 * 1000)),
+};
+
+// Auto-discovery config
+const DISC = {
+  MIN_VOLUME:    parseFloat(process.env.DISC_MIN_VOLUME    || '200000'),
+  MIN_CHANGE:    parseFloat(process.env.DISC_MIN_CHANGE    || '20'),
+  MIN_LIQUIDITY: parseFloat(process.env.DISC_MIN_LIQUIDITY || '30000'),
+  MAX_AGE_H:     parseFloat(process.env.DISC_MAX_AGE       || '72'),
+  MAX_TOKENS:    parseInt(process.env.DISC_MAX_TOKENS      || '3'),
 };
 
 const REDIS_URL   = process.env.UPSTASH_REDIS_REST_URL;
@@ -42,9 +52,12 @@ let state = {
   positions: {}, watchlist: DEFAULT_TOKENS, trades: [],
   lastAction: 'Initializing...', lastCheck: null, errors: [], signals: {},
   priceHistory: {}, timeWindow: null, circuitOpen: false, circuitReason: null,
-  consecutiveLosses: 0, totalPnl: 0,
+  consecutiveLosses: 0, totalPnl: 0, autoDiscovered: [],
 };
 
+let autoAddedTokens = {};
+
+// ── Persistence ───────────────────────────────────────────────────────────────
 async function saveState() {
   try { fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2)); } catch(e) {}
   if (!REDIS_URL || !REDIS_TOKEN) return;
@@ -68,7 +81,7 @@ async function loadState() {
         let parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
         if (typeof parsed === 'string') parsed = JSON.parse(parsed);
         state = { ...state, ...parsed };
-        state.watchlist = Object.assign({}, DEFAULT_TOKENS, state.watchlist);
+        state.watchlist = Object.assign({}, state.watchlist);
         log('State loaded from Redis'); return;
       }
     } catch(e) { log('Redis load failed: ' + e.message); }
@@ -77,7 +90,6 @@ async function loadState() {
     if (fs.existsSync(STATE_FILE)) {
       const saved = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
       state = { ...state, ...saved };
-      state.watchlist = Object.assign({}, DEFAULT_TOKENS, state.watchlist);
     }
   } catch(e) { log('Fresh state'); }
 }
@@ -93,6 +105,7 @@ function addError(msg) {
   if (state.errors.length > 20) state.errors.pop();
 }
 
+// ── Price History ─────────────────────────────────────────────────────────────
 function updatePriceHistory(token, price) {
   if (!state.priceHistory[token]) state.priceHistory[token] = [];
   state.priceHistory[token].push({ price, time: Date.now() });
@@ -139,23 +152,74 @@ function buildMomentumScore(opts) {
   return { score, blocked: null };
 }
 
+// ── Auto-Discovery ────────────────────────────────────────────────────────────
+async function scanForNewTokens() {
+  try {
+    log('Auto-discovery scan running...');
+    const res = await fetch('https://api.dexscreener.com/latest/dex/search?q=solana', { timeout: 15000 });
+    const data = await res.json();
+    if (!data.pairs) return;
+    const now = Date.now();
+    const candidates = [];
+    const SKIP = ['USDC','USDT','SOL','WSOL','BTC','ETH','WBTC','WETH'];
+    for (const pair of data.pairs) {
+      try {
+        if (pair.chainId !== 'solana') continue;
+        const symbol = (pair.baseToken && pair.baseToken.symbol || '').toUpperCase().replace(/[^A-Z0-9]/g,'');
+        const mint = pair.baseToken && pair.baseToken.address;
+        if (!symbol || !mint || symbol.length > 12) continue;
+        if (state.watchlist[symbol] || autoAddedTokens[symbol]) continue;
+        if (SKIP.includes(symbol)) continue;
+        const volume24h = (pair.volume && pair.volume.h24) || 0;
+        const change24h = (pair.priceChange && pair.priceChange.h24) || 0;
+        const liquidity = (pair.liquidity && pair.liquidity.usd) || 0;
+        const ageH = (now - (pair.pairCreatedAt || 0)) / 3600000;
+        if (volume24h < DISC.MIN_VOLUME) continue;
+        if (change24h < DISC.MIN_CHANGE) continue;
+        if (liquidity < DISC.MIN_LIQUIDITY) continue;
+        if (ageH > DISC.MAX_AGE_H) continue;
+        candidates.push({ symbol, mint, volume24h, change24h, liquidity, ageH });
+      } catch(e) {}
+    }
+    candidates.sort((a,b) => (b.volume24h*b.change24h) - (a.volume24h*a.change24h));
+    const slots = DISC.MAX_TOKENS - Object.keys(autoAddedTokens).length;
+    const toAdd = candidates.slice(0, Math.min(slots, 2));
+    for (const t of toAdd) {
+      const msg = 'Auto-discovered: ' + t.symbol + ' +' + t.change24h.toFixed(1) + '% vol=$' + Math.round(t.volume24h/1000) + 'k liq=$' + Math.round(t.liquidity/1000) + 'k age=' + t.ageH.toFixed(1) + 'h';
+      log(msg);
+      state.watchlist[t.symbol] = { mint: t.mint, decimals: 6, cgId: null };
+      autoAddedTokens[t.symbol] = { addedAt: now, mint: t.mint };
+      if (!state.autoDiscovered) state.autoDiscovered = [];
+      state.autoDiscovered.unshift({ symbol: t.symbol, time: new Date().toISOString(), change24h: t.change24h, volume24h: t.volume24h });
+      if (state.autoDiscovered.length > 20) state.autoDiscovered.pop();
+    }
+    if (toAdd.length > 0) { log('Added to watchlist: ' + toAdd.map(t=>t.symbol).join(', ')); await saveState(); }
+    // Remove stale auto tokens (no position after 24h)
+    for (const [sym, info] of Object.entries(autoAddedTokens)) {
+      if ((now - info.addedAt) / 3600000 > 24 && !state.positions[sym]) {
+        log('Removing stale auto-token: ' + sym);
+        delete state.watchlist[sym];
+        delete autoAddedTokens[sym];
+        await saveState();
+      }
+    }
+  } catch(e) { log('Discovery error: ' + e.message); }
+}
+
+// ── Solana Helpers ────────────────────────────────────────────────────────────
 async function getSolBalance(connection, publicKey) {
   return (await connection.getBalance(publicKey)) / 1e9;
 }
 
 async function getTokenBalance(connection, walletPubkey, tokenMint, decimals) {
   try {
-    // Try standard SPL token first
     const ata = await getAssociatedTokenAddress(new PublicKey(tokenMint), walletPubkey);
     const account = await getAccount(connection, ata);
     return Number(account.amount) / Math.pow(10, decimals);
   } catch(e) {
     try {
-      // Fallback: use getParsedTokenAccountsByOwner which works for both SPL and Token-2022
       const accounts = await connection.getParsedTokenAccountsByOwner(walletPubkey, { mint: new PublicKey(tokenMint) });
-      if (accounts.value.length > 0) {
-        return accounts.value[0].account.data.parsed.info.tokenAmount.uiAmount || 0;
-      }
+      if (accounts.value.length > 0) return accounts.value[0].account.data.parsed.info.tokenAmount.uiAmount || 0;
     } catch(e2) {}
     return 0;
   }
@@ -189,6 +253,7 @@ async function executeSwap(connection, wallet, quote) {
   } catch(e) { log('Swap failed: ' + e.message); addError(e.message); return null; }
 }
 
+// ── Main Strategy Loop ────────────────────────────────────────────────────────
 async function evaluateStrategy(connection, wallet) {
   if (state.circuitOpen) { log('Circuit open: ' + state.circuitReason); return; }
   log('Scanning ' + Object.keys(state.watchlist).length + ' tokens | Positions: ' + Object.keys(state.positions).length + '/' + CONFIG.MAX_POSITIONS);
@@ -204,8 +269,6 @@ async function evaluateStrategy(connection, wallet) {
 
   const tokenData = {};
   const watchTokens = Object.keys(state.watchlist);
-
-  // Get SOL price once
   let globalSolUsd = 100;
   try {
     const cgHeaders = COINGECKO_API_KEY ? { 'x-cg-demo-api-key': COINGECKO_API_KEY } : {};
@@ -221,8 +284,6 @@ async function evaluateStrategy(connection, wallet) {
     try {
       const cgHeaders = COINGECKO_API_KEY ? { 'x-cg-demo-api-key': COINGECKO_API_KEY } : {};
       let tokenUsd = null, solUsd = globalSolUsd, volume24h = 0, change24h = 0, sentimentScore = null;
-
-      // Try CoinGecko first
       if (info.cgId) {
         try {
           const priceRes = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=' + info.cgId + ',solana&vs_currencies=usd', { timeout: 10000, headers: cgHeaders });
@@ -233,39 +294,29 @@ async function evaluateStrategy(connection, wallet) {
           }
         } catch(e) {}
       }
-
-      // Fallback to DEX Screener if CoinGecko failed or no cgId
       if (!tokenUsd && info.mint) {
         try {
           const dsRes = await fetch('https://api.dexscreener.com/latest/dex/tokens/' + info.mint, { timeout: 10000 });
           const dsData = await dsRes.json();
           if (dsData.pairs && dsData.pairs.length > 0) {
-            const pair = dsData.pairs.sort((a,b) => (b.liquidity?.usd||0) - (a.liquidity?.usd||0))[0];
-            if (pair.priceUsd) {
-              tokenUsd = parseFloat(pair.priceUsd);
-              volume24h = pair.volume?.h24 || 0;
-              change24h = pair.priceChange?.h24 || 0;
-            }
+            const pair = dsData.pairs.sort((a,b) => ((b.liquidity&&b.liquidity.usd)||0) - ((a.liquidity&&a.liquidity.usd)||0))[0];
+            if (pair.priceUsd) { tokenUsd = parseFloat(pair.priceUsd); volume24h = (pair.volume&&pair.volume.h24)||0; change24h = (pair.priceChange&&pair.priceChange.h24)||0; }
           }
         } catch(e) {}
       }
-
       if (!tokenUsd || !solUsd) { if (i > 0) await new Promise(r => setTimeout(r, 800)); continue; }
-
       const priceSol = tokenUsd / solUsd;
       updatePriceHistory(name, priceSol);
       if (i > 0) await new Promise(r => setTimeout(r, 800));
-
-      // Get extra CoinGecko data if available
       if (info.cgId && tokenUsd) {
         try {
           const cgRes = await fetch('https://api.coingecko.com/api/v3/coins/' + info.cgId + '?localization=false&tickers=false&community_data=true&developer_data=false', { timeout: 10000, headers: cgHeaders });
           const cgData = await cgRes.json();
           if (cgData.market_data) {
-            volume24h = cgData.market_data.total_volume?.usd || volume24h;
-            change24h = cgData.market_data.price_change_percentage_24h || change24h;
-            const change1h = cgData.market_data.price_change_percentage_1h_in_currency?.usd || 0;
-            const upPct = cgData.sentiment_votes_up_percentage || 50;
+            volume24h = (cgData.market_data.total_volume&&cgData.market_data.total_volume.usd)||volume24h;
+            change24h = cgData.market_data.price_change_percentage_24h||change24h;
+            const change1h = (cgData.market_data.price_change_percentage_1h_in_currency&&cgData.market_data.price_change_percentage_1h_in_currency.usd)||0;
+            const upPct = cgData.sentiment_votes_up_percentage||50;
             sentimentScore = ((upPct-(100-upPct))/100)*0.4 + Math.tanh((change1h*2+change24h*0.5)/10)*0.6;
           }
         } catch(e) {}
@@ -290,16 +341,14 @@ async function evaluateStrategy(connection, wallet) {
     const pctFromEntry = pos.entryPrice > 0 ? (sig.priceSol - pos.entryPrice) / pos.entryPrice : 0;
     const pctFromPeak = pos.peakPrice > 0 ? (sig.priceSol - pos.peakPrice) / pos.peakPrice : 0;
     if (sig.priceSol > (pos.peakPrice || 0)) state.positions[token].peakPrice = sig.priceSol;
+    const heldMs = Date.now() - new Date(pos.openedAt).getTime();
+    const minHoldMet = heldMs >= CONFIG.MIN_HOLD_MS;
     let exitReason = null;
     if (pctFromEntry < -CONFIG.STOP_LOSS) exitReason = 'stop-loss (' + (pctFromEntry*100).toFixed(1) + '%)';
-    else if (pctFromEntry > CONFIG.TRAILING_ARM_PCT && pctFromPeak < -0.10) exitReason = 'trailing stop (' + (pctFromPeak*100).toFixed(1) + '% from peak)';
-    // Exit if momentum is dead (score=0 AND negative P&L AND held for more than 10 minutes)
-    else if (sig.score < CONFIG.MOMENTUM_EXIT && !sig.blocked) exitReason = 'momentum died';
-    else if (sig.score === 0 && pctFromEntry < -0.02) {
-      const heldMs = Date.now() - new Date(pos.openedAt).getTime();
-      if (heldMs > 10 * 60 * 1000) exitReason = 'no momentum + losing (' + (pctFromEntry*100).toFixed(1) + '%)';
-    }
-    if (exitReason) { log('🔴 SELL ' + token + ': ' + exitReason); await executeSell(connection, wallet, token, pos, sig); }
+    else if (minHoldMet && pctFromEntry > CONFIG.TRAILING_ARM_PCT && pctFromPeak < -0.10) exitReason = 'trailing stop (' + (pctFromPeak*100).toFixed(1) + '% from peak)';
+    else if (minHoldMet && sig.score < CONFIG.MOMENTUM_EXIT && !sig.blocked) exitReason = 'momentum died';
+    else if (minHoldMet && sig.score === 0 && pctFromEntry < -0.02) exitReason = 'no momentum + losing (' + (pctFromEntry*100).toFixed(1) + '%)';
+    if (exitReason) { log('SELL ' + token + ': ' + exitReason); await executeSell(connection, wallet, token, pos, sig); }
     else log('Holding ' + token + '. P&L: ' + (pctFromEntry>=0?'+':'') + (pctFromEntry*100).toFixed(2) + '% | mom=' + (sig.momentum*100).toFixed(2) + '%');
   }
 
@@ -307,10 +356,9 @@ async function evaluateStrategy(connection, wallet) {
   const availableSlots = CONFIG.MAX_POSITIONS - openCount;
   if (availableSlots > 0 && state.currentSol > CONFIG.MIN_RESERVE_SOL + CONFIG.TRADE_SIZE_SOL) {
     const candidates = Object.entries(tokenData).filter(([n,d]) => !state.positions[n] && !d.blocked && d.score >= CONFIG.BUY_THRESHOLD).sort((a,b) => b[1].score - a[1].score).slice(0, availableSlots);
-    if (candidates.length > 0) { for (const [n,d] of candidates) { if (state.currentSol < CONFIG.MIN_RESERVE_SOL + CONFIG.TRADE_SIZE_SOL) break; log('🟢 BUY ' + n + ' score=' + d.score.toFixed(5)); await executeBuy(connection, wallet, n, d); } }
+    if (candidates.length > 0) { for (const [n,d] of candidates) { if (state.currentSol < CONFIG.MIN_RESERVE_SOL + CONFIG.TRADE_SIZE_SOL) break; log('BUY ' + n + ' score=' + d.score.toFixed(5)); await executeBuy(connection, wallet, n, d); } }
     else log('No momentum signals. Watching...');
   } else if (availableSlots === 0) log('All slots filled.');
-
   await saveState();
 }
 
@@ -325,18 +373,14 @@ async function executeBuy(connection, wallet, tokenName, tokenData) {
     if (!quote) return;
     const sig = await executeSwap(connection, wallet, quote);
     if (!sig) return;
-
-    // Wait 5 seconds for token account to register on-chain
     await new Promise(r => setTimeout(r, 5000));
-
     const onChain = await getTokenBalance(connection, wallet.publicKey, info.mint, info.decimals);
     const tokensReceived = onChain > 0 ? onChain : parseFloat(quote.outAmount) / Math.pow(10, info.decimals);
-
     state.currentSol = await getSolBalance(connection, wallet.publicKey);
     state.positions[tokenName] = { amount: tokensReceived, entryPrice: tokenData.priceSol, entryPriceUsd: tokenData.tokenUsd, peakPrice: tokenData.priceSol, solSpent: tradeSOL, openedAt: new Date().toISOString() };
     state.trades.unshift({ type: 'BUY', token: tokenName, solSpent: tradeSOL, tokensReceived, price: tokenData.priceSol, priceUsd: tokenData.tokenUsd, score: tokenData.score, sig, time: new Date().toISOString() });
     if (state.trades.length > 100) state.trades.pop();
-    log('✅ Bought ' + tokenName + ' ' + tokensReceived.toFixed(2) + ' tokens. Tx: ' + sig);
+    log('Bought ' + tokenName + ' ' + tokensReceived.toFixed(2) + ' tokens. Tx: ' + sig);
     await saveState();
   } catch(e) { log('Buy failed: ' + e.message); addError(e.message); }
 }
@@ -359,7 +403,7 @@ async function executeSell(connection, wallet, tokenName, pos, tokenData) {
     delete state.positions[tokenName];
     state.trades.unshift({ type: 'SELL', token: tokenName, solReceived, pnl, sig, time: new Date().toISOString() });
     if (state.trades.length > 100) state.trades.pop();
-    log('✅ Sold ' + tokenName + '. PnL: ' + (pnl>=0?'+':'') + pnl.toFixed(4) + ' SOL');
+    log('Sold ' + tokenName + '. PnL: ' + (pnl>=0?'+':'') + pnl.toFixed(4) + ' SOL');
     await saveState();
   } catch(e) { log('Sell failed: ' + e.message); addError(e.message); }
 }
@@ -372,7 +416,6 @@ async function main() {
   state.wallet = wallet.publicKey.toString();
   state.running = true;
   if (!state.positions) state.positions = {};
-  // Always merge DEFAULT_TOKENS so newly added tokens always appear
   state.watchlist = Object.assign({}, state.watchlist, DEFAULT_TOKENS);
   log('Momentum Bot v2 started');
   log('Watching ' + Object.keys(state.watchlist).length + ' tokens | ' + CONFIG.MAX_POSITIONS + ' max positions');
@@ -380,30 +423,26 @@ async function main() {
   state.currentSol = await getSolBalance(connection, wallet.publicKey);
   if (!state.startingSol) state.startingSol = state.currentSol;
   log('Balance: ' + state.currentSol.toFixed(4) + ' SOL');
-
-  // Scan all watchlist tokens for untracked on-chain positions
   log('Checking on-chain balances for untracked positions...');
   for (const [name, info] of Object.entries(state.watchlist)) {
-    if (state.positions[name]) continue; // already tracked
+    if (state.positions[name]) continue;
     try {
       const onChain = await getTokenBalance(connection, wallet.publicKey, info.mint, info.decimals);
       if (onChain > 0.000001) {
         log('Found untracked position: ' + name + ' (' + onChain.toFixed(4) + ' tokens) — adding to positions');
-        state.positions[name] = {
-          amount: onChain,
-          entryPrice: 0, // unknown entry price
-          entryPriceUsd: 0,
-          peakPrice: 0,
-          solSpent: CONFIG.TRADE_SIZE_SOL, // assume standard trade size
-          openedAt: new Date().toISOString(),
-        };
+        state.positions[name] = { amount: onChain, entryPrice: 0, entryPriceUsd: 0, peakPrice: 0, solSpent: CONFIG.TRADE_SIZE_SOL, openedAt: new Date().toISOString() };
       }
     } catch(e) {}
   }
   log('Positions after startup scan: ' + Object.keys(state.positions).join(', ') || 'none');
   await saveState();
+  let loopCount = 0;
   while (true) {
-    try { await evaluateStrategy(connection, wallet); }
+    try {
+      if (loopCount % 10 === 0) await scanForNewTokens();
+      loopCount++;
+      await evaluateStrategy(connection, wallet);
+    }
     catch(e) { log('Loop error: ' + e.message); addError(e.message); }
     await new Promise(r => setTimeout(r, CONFIG.SCAN_INTERVAL_MS));
   }
