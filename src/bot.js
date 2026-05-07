@@ -157,45 +157,102 @@ function buildMomentumScore(opts) {
 async function scanForNewTokens() {
   try {
     log('Auto-discovery scan running...');
-    const res = await fetch('https://api.dexscreener.com/latest/dex/search?q=solana', { timeout: 15000 });
-    const data = await res.json();
-    if (!data.pairs) return;
     const now = Date.now();
+    const SKIP = new Set(['USDC','USDT','SOL','WSOL','BTC','ETH','WBTC','WETH','RAY','JUP','ORCA','MNGO']);
+    let pairs = [];
+
+    // Strategy 1: DEX Screener trending Solana tokens
+    try {
+      const trendRes = await fetch('https://api.dexscreener.com/token-boosts/top/v1', { timeout: 12000 });
+      const trendData = await trendRes.json();
+      // token-boosts returns array of { tokenAddress, chainId, ... }
+      const solMints = (Array.isArray(trendData) ? trendData : [])
+        .filter(t => t.chainId === 'solana')
+        .map(t => t.tokenAddress)
+        .filter(Boolean)
+        .slice(0, 20);
+      if (solMints.length > 0) {
+        // Fetch pair data for these mints
+        for (const mint of solMints.slice(0, 10)) {
+          try {
+            const pRes = await fetch('https://api.dexscreener.com/latest/dex/tokens/' + mint, { timeout: 10000 });
+            const pData = await pRes.json();
+            if (pData.pairs) pairs.push(...pData.pairs);
+            await new Promise(r => setTimeout(r, 300));
+          } catch(e) {}
+        }
+      }
+    } catch(e) { log('Discovery: token-boosts failed: ' + e.message); }
+
+    // Strategy 2: Fallback — search for pumping Solana meme tokens
+    if (pairs.length === 0) {
+      try {
+        const searchRes = await fetch('https://api.dexscreener.com/latest/dex/search?q=pump%20solana', { timeout: 12000 });
+        const searchData = await searchRes.json();
+        if (searchData.pairs) pairs.push(...searchData.pairs);
+      } catch(e) {}
+    }
+
+    if (pairs.length === 0) { log('Discovery: no pairs returned'); return; }
+
     const candidates = [];
-    const SKIP = ['USDC','USDT','SOL','WSOL','BTC','ETH','WBTC','WETH'];
-    for (const pair of data.pairs) {
+    for (const pair of pairs) {
       try {
         if (pair.chainId !== 'solana') continue;
         const symbol = (pair.baseToken && pair.baseToken.symbol || '').toUpperCase().replace(/[^A-Z0-9]/g,'');
         const mint = pair.baseToken && pair.baseToken.address;
         if (!symbol || !mint || symbol.length > 12) continue;
         if (state.watchlist[symbol] || autoAddedTokens[symbol]) continue;
-        if (SKIP.includes(symbol)) continue;
-        const volume24h = (pair.volume && pair.volume.h24) || 0;
-        const change24h = (pair.priceChange && pair.priceChange.h24) || 0;
-        const liquidity = (pair.liquidity && pair.liquidity.usd) || 0;
-        const ageH = (now - (pair.pairCreatedAt || 0)) / 3600000;
-        if (volume24h < DISC.MIN_VOLUME) continue;
-        if (change24h < DISC.MIN_CHANGE) continue;
-        if (liquidity < DISC.MIN_LIQUIDITY) continue;
-        if (ageH > DISC.MAX_AGE_H) continue;
-        candidates.push({ symbol, mint, volume24h, change24h, liquidity, ageH });
+        if (SKIP.has(symbol)) continue;
+
+        const volume24h  = (pair.volume && pair.volume.h24)           || 0;
+        const change24h  = (pair.priceChange && pair.priceChange.h24) || 0;
+        const liquidity  = (pair.liquidity && pair.liquidity.usd)     || 0;
+        const priceUsd   = parseFloat(pair.priceUsd || '0');
+
+        // Filters — age check is optional (pairCreatedAt often 0 for legit tokens)
+        if (volume24h  < DISC.MIN_VOLUME)    continue;
+        if (change24h  < DISC.MIN_CHANGE)    continue;
+        if (liquidity  < DISC.MIN_LIQUIDITY) continue;
+        if (priceUsd   <= 0)                 continue;
+
+        // Only apply age filter if pairCreatedAt is a real value (not 0/null)
+        if (pair.pairCreatedAt && pair.pairCreatedAt > 1000000) {
+          const ageH = (now - pair.pairCreatedAt) / 3600000;
+          if (ageH > DISC.MAX_AGE_H) continue;
+        }
+
+        candidates.push({ symbol, mint, volume24h, change24h, liquidity, priceUsd });
       } catch(e) {}
     }
-    candidates.sort((a,b) => (b.volume24h*b.change24h) - (a.volume24h*a.change24h));
+
+    // Deduplicate by mint address
+    const seen = new Set();
+    const unique = candidates.filter(c => { if (seen.has(c.mint)) return false; seen.add(c.mint); return true; });
+    unique.sort((a,b) => (b.volume24h * b.change24h) - (a.volume24h * a.change24h));
+
+    log('Discovery: ' + pairs.length + ' pairs scanned, ' + unique.length + ' candidates found');
+
     const slots = DISC.MAX_TOKENS - Object.keys(autoAddedTokens).length;
-    const toAdd = candidates.slice(0, Math.min(slots, 2));
+    const toAdd = unique.slice(0, Math.min(slots, 2));
+
     for (const t of toAdd) {
-      const msg = 'Auto-discovered: ' + t.symbol + ' +' + t.change24h.toFixed(1) + '% vol=$' + Math.round(t.volume24h/1000) + 'k liq=$' + Math.round(t.liquidity/1000) + 'k age=' + t.ageH.toFixed(1) + 'h';
-      log(msg);
+      log('Auto-discovered: ' + t.symbol + ' +' + t.change24h.toFixed(1) + '% vol=$' + Math.round(t.volume24h/1000) + 'k liq=$' + Math.round(t.liquidity/1000) + 'k $' + t.priceUsd.toFixed(6));
       state.watchlist[t.symbol] = { mint: t.mint, decimals: 6, cgId: null };
       autoAddedTokens[t.symbol] = { addedAt: now, mint: t.mint };
       if (!state.autoDiscovered) state.autoDiscovered = [];
       state.autoDiscovered.unshift({ symbol: t.symbol, time: new Date().toISOString(), change24h: t.change24h, volume24h: t.volume24h });
       if (state.autoDiscovered.length > 20) state.autoDiscovered.pop();
     }
-    if (toAdd.length > 0) { log('Added to watchlist: ' + toAdd.map(t=>t.symbol).join(', ')); await saveState(); }
-    // Remove stale auto tokens (no position after 24h)
+
+    if (toAdd.length > 0) {
+      log('Added to watchlist: ' + toAdd.map(t=>t.symbol).join(', '));
+      await saveState();
+    } else {
+      log('Discovery: no new tokens met criteria');
+    }
+
+    // Remove stale auto tokens (no position held after 24h)
     for (const [sym, info] of Object.entries(autoAddedTokens)) {
       if ((now - info.addedAt) / 3600000 > 24 && !state.positions[sym]) {
         log('Removing stale auto-token: ' + sym);
@@ -204,7 +261,7 @@ async function scanForNewTokens() {
         await saveState();
       }
     }
-  } catch(e) { log('Discovery error: ' + e.message); }
+  } catch(e) { log('Discovery error: ' + e.message); addError('Discovery: ' + e.message); }
 }
 
 // ── Solana Helpers ────────────────────────────────────────────────────────────
