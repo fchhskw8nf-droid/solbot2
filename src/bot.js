@@ -18,8 +18,8 @@ const CONFIG = {
   SCAN_INTERVAL_MS:   parseInt(process.env.SCAN_INTERVAL_MS || '60000'),
   MOMENTUM_EXIT:      parseFloat(process.env.MOMENTUM_EXIT  || '-0.005'),
   MIN_VOLUME_USD:     parseFloat(process.env.MIN_VOLUME_USD || '50000'),
-  TRAILING_ARM_PCT:   parseFloat(process.env.TRAILING_ARM   || '0.20'),  // trailing stop 20% (was 10%)
-  MIN_HOLD_MS:        parseInt(process.env.MIN_HOLD_MS      || String(30 * 60 * 1000)),  // 30 min (was 4h)
+  TRAILING_ARM_PCT:   parseFloat(process.env.TRAILING_ARM   || '0.15'),  // trailing stop 15%
+  MIN_HOLD_MS:        parseInt(process.env.MIN_HOLD_MS      || String(60 * 60 * 1000)),  // 60 min
   VOL_DROP_THRESHOLD: parseFloat(process.env.VOL_DROP_THRESHOLD || '0.30'), // exit when volume drops 30% from entry
 };
 
@@ -54,6 +54,7 @@ let state = {
   lastAction: 'Initializing...', lastCheck: null, errors: [], signals: {},
   priceHistory: {}, timeWindow: null, circuitOpen: false, circuitReason: null,
   consecutiveLosses: 0, totalPnl: 0, autoDiscovered: [], pendingBuys: {},
+  boughtMints: {},     // mint→symbol map of tokens the bot has purchased
 };
 
 let autoAddedTokens = {};
@@ -440,6 +441,8 @@ async function executeBuy(connection, wallet, tokenName, tokenData) {
     delete state.pendingBuys[tokenName]; // clear intent — fully tracked
     state.trades.unshift({ type: 'BUY', token: tokenName, solSpent: tradeSOL, tokensReceived, price: tokenData.priceSol, priceUsd: tokenData.tokenUsd, score: tokenData.score, sig, time: new Date().toISOString() });
     if (state.trades.length > 100) state.trades.pop();
+    if (!state.boughtMints) state.boughtMints = {};
+    state.boughtMints[info.mint] = tokenName;  // whitelist this mint
     log('Bought ' + tokenName + ' ' + tokensReceived.toFixed(2) + ' tokens. Tx: ' + sig);
     await saveState();
   } catch(e) { log('Buy failed: ' + e.message); addError(e.message); }
@@ -449,6 +452,11 @@ async function executeSell(connection, wallet, tokenName, pos, tokenData) {
   try {
     const info = state.watchlist[tokenName];
     if (!info) return;
+    // Security: only sell tokens the bot itself bought
+    if (!state.boughtMints || !state.boughtMints[info.mint]) {
+      log('SECURITY: refusing to sell ' + tokenName + ' — not in bought mints list');
+      return;
+    }
     const onChain = await getTokenBalance(connection, wallet.publicKey, info.mint, info.decimals);
     if (onChain < 0.000001) { delete state.positions[tokenName]; await saveState(); return; }
     const quote = await getSwapQuote(info.mint, SOL_MINT, Math.floor(onChain * Math.pow(10, info.decimals)));
@@ -463,6 +471,7 @@ async function executeSell(connection, wallet, tokenName, pos, tokenData) {
     delete state.positions[tokenName];
     state.trades.unshift({ type: 'SELL', token: tokenName, solReceived, pnl, sig, time: new Date().toISOString() });
     if (state.trades.length > 100) state.trades.pop();
+    if (state.boughtMints) delete state.boughtMints[info.mint];  // remove from whitelist
     log('Sold ' + tokenName + '. PnL: ' + (pnl>=0?'+':'') + pnl.toFixed(4) + ' SOL');
     await saveState();
   } catch(e) { log('Sell failed: ' + e.message); addError(e.message); }
@@ -552,14 +561,19 @@ async function main() {
     await saveState();
   }
 
-  log('Checking on-chain balances for untracked positions...');
-  for (const [name, info] of Object.entries(state.watchlist)) {
-    if (state.positions[name]) continue;
+  // SECURITY: Only recover positions for tokens the bot actually bought.
+  // Airdropped or unknown tokens in the wallet are ignored completely.
+  if (!state.boughtMints) state.boughtMints = {};
+  log('Checking on-chain balances for bot-purchased positions...');
+  for (const [mint, symbol] of Object.entries(state.boughtMints)) {
+    if (state.positions[symbol]) continue;
+    const info = state.watchlist[symbol];
+    if (!info) continue;
     try {
-      const onChain = await getTokenBalance(connection, wallet.publicKey, info.mint, info.decimals);
+      const onChain = await getTokenBalance(connection, wallet.publicKey, mint, info.decimals);
       if (onChain > 0.000001) {
-        log('Found untracked position: ' + name + ' (' + onChain.toFixed(4) + ' tokens) — adding to positions');
-        state.positions[name] = { amount: onChain, entryPrice: 0, entryPriceUsd: 0, peakPrice: 0, solSpent: CONFIG.TRADE_SIZE_SOL, openedAt: new Date().toISOString(), zeroBalanceCount: 0 };
+        log('Recovered purchased position: ' + symbol + ' (' + onChain.toFixed(4) + ' tokens)');
+        state.positions[symbol] = { amount: onChain, entryPrice: 0, entryPriceUsd: 0, peakPrice: 0, solSpent: CONFIG.TRADE_SIZE_SOL, openedAt: new Date().toISOString(), zeroBalanceCount: 0 };
       }
     } catch(e) {}
   }
