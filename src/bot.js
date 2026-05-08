@@ -57,6 +57,7 @@ let state = {
 };
 
 let autoAddedTokens = {};
+let warmupScansRemaining = 0;
 
 // ── Persistence ───────────────────────────────────────────────────────────────
 async function saveState() {
@@ -398,7 +399,10 @@ async function evaluateStrategy(connection, wallet) {
 
   const openCount = Object.keys(state.positions).length;
   const availableSlots = CONFIG.MAX_POSITIONS - openCount;
-  if (availableSlots > 0 && state.currentSol > CONFIG.MIN_RESERVE_SOL + CONFIG.TRADE_SIZE_SOL) {
+  if (warmupScansRemaining > 0) {
+    warmupScansRemaining--;
+    log('Warmup: ' + warmupScansRemaining + ' scans remaining before buys enabled');
+  } else if (availableSlots > 0 && state.currentSol > CONFIG.MIN_RESERVE_SOL + CONFIG.TRADE_SIZE_SOL) {
     const candidates = Object.entries(tokenData).filter(([n,d]) => !state.positions[n] && !d.blocked && d.score >= CONFIG.BUY_THRESHOLD).sort((a,b) => b[1].score - a[1].score).slice(0, availableSlots);
     if (candidates.length > 0) { for (const [n,d] of candidates) { if (state.currentSol < CONFIG.MIN_RESERVE_SOL + CONFIG.TRADE_SIZE_SOL) break; log('BUY ' + n + ' score=' + d.score.toFixed(5)); await executeBuy(connection, wallet, n, d); } }
     else log('No momentum signals. Watching...');
@@ -464,6 +468,57 @@ async function executeSell(connection, wallet, tokenName, pos, tokenData) {
   } catch(e) { log('Sell failed: ' + e.message); addError(e.message); }
 }
 
+
+// ── Bootstrap Price History ───────────────────────────────────────────────────
+async function bootstrapPriceHistory() {
+  log('Bootstrapping price history...');
+  let solUsd = 150;
+  try {
+    const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd', { timeout: 10000 });
+    const d = await r.json();
+    if (d.solana && d.solana.usd) solUsd = d.solana.usd;
+  } catch(e) {}
+
+  const tokens = Object.keys(state.watchlist);
+  for (let i = 0; i < tokens.length; i++) {
+    const name = tokens[i];
+    const info = state.watchlist[name];
+    if (!info || !info.mint) continue;
+    try {
+      const res = await fetch('https://api.dexscreener.com/latest/dex/tokens/' + info.mint, { timeout: 12000 });
+      const data = await res.json();
+      if (!data.pairs || data.pairs.length === 0) continue;
+      const pair = data.pairs.sort(function(a,b){
+        return ((b.liquidity&&b.liquidity.usd)||0) - ((a.liquidity&&a.liquidity.usd)||0);
+      })[0];
+      const curUsd = parseFloat(pair.priceUsd || '0');
+      if (!curUsd) continue;
+      const change24h = (pair.priceChange && pair.priceChange.h24) || 0;
+      const change6h  = (pair.priceChange && pair.priceChange.h6)  || change24h / 4;
+      const price24hAgo = curUsd / (1 + change24h / 100);
+      const price6hAgo  = curUsd / (1 + change6h  / 100);
+      state.priceHistory[name] = [];
+      const now = Date.now();
+      for (let j = 0; j < 15; j++) {
+        const t = j / 14;
+        const synthUsd = price24hAgo + (price6hAgo - price24hAgo) * t;
+        state.priceHistory[name].push({ price: synthUsd / solUsd, time: now - (19 - j) * 7200000 });
+      }
+      for (let j = 0; j < 5; j++) {
+        const t = j / 4;
+        const synthUsd = price6hAgo + (curUsd - price6hAgo) * t;
+        state.priceHistory[name].push({ price: synthUsd / solUsd, time: now - (4 - j) * 3600000 });
+      }
+      log('Bootstrap ' + name + ': 20 pts, mom=' + (getMomentum(name)*100).toFixed(2) + '% vol=' + (getVolatility(name)*100).toFixed(3) + '%');
+      if (i < tokens.length - 1) await new Promise(r => setTimeout(r, 500));
+    } catch(e) {
+      log('Bootstrap failed for ' + name + ': ' + e.message);
+    }
+  }
+  log('Bootstrap complete — 6 scan warmup before new buys enabled.');
+  warmupScansRemaining = 6;
+}
+
 async function main() {
   if (!PRIVATE_KEY) { console.error('PRIVATE_KEY not set'); process.exit(1); }
   await loadState();
@@ -510,6 +565,7 @@ async function main() {
   }
   log('Positions after startup scan: ' + Object.keys(state.positions).join(', ') || 'none');
   await saveState();
+  await bootstrapPriceHistory();
   let loopCount = 0;
   while (true) {
     try {
