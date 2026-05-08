@@ -257,21 +257,31 @@ async function getSwapQuote(inputMint, outputMint, amount, slippageBps) {
   } catch(e) { log('Quote failed: ' + e.message); return null; }
 }
 
-async function executeSwap(connection, wallet, quote) {
+async function executeSwap(connection, wallet, quote, attempt) {
+  attempt = attempt || 1;
+  // Escalating priority fees: auto → 50k → 200k lamports
+  const priorityFees = ['auto', 50000, 200000];
+  const prioritizationFeeLamports = priorityFees[Math.min(attempt - 1, priorityFees.length - 1)];
   try {
     const res = await fetch('https://lite-api.jup.ag/swap/v1/swap', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ quoteResponse: quote, userPublicKey: wallet.publicKey.toString(), wrapAndUnwrapSol: true, dynamicComputeUnitLimit: true, prioritizationFeeLamports: 'auto' }),
-      timeout: 15000,
+      body: JSON.stringify({ quoteResponse: quote, userPublicKey: wallet.publicKey.toString(), wrapAndUnwrapSol: true, dynamicComputeUnitLimit: true, prioritizationFeeLamports: prioritizationFeeLamports }),
+      timeout: 20000,
     });
     const result = await res.json();
     if (result.error) throw new Error(result.error);
     const tx = VersionedTransaction.deserialize(Buffer.from(result.swapTransaction, 'base64'));
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+    tx.message.recentBlockhash = blockhash;
     tx.sign([wallet]);
-    const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 3 });
-    await connection.confirmTransaction(sig, 'confirmed');
+    const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, maxRetries: 3 });
+    await connection.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, 'confirmed');
     return sig;
-  } catch(e) { log('Swap failed: ' + e.message); addError(e.message); return null; }
+  } catch (e) {
+    log('Swap failed (attempt ' + attempt + ', fee=' + prioritizationFeeLamports + '): ' + e.message);
+    addError(e.message);
+    return null;
+  }
 }
 
 // ── Main Strategy Loop ────────────────────────────────────────────────────────
@@ -426,7 +436,16 @@ async function executeBuy(connection, wallet, tokenName, tokenData) {
     state.pendingBuys[tokenName] = { mint: info.mint, decimals: info.decimals, entryPrice: tokenData.priceSol, entryPriceUsd: tokenData.tokenUsd, solSpent: tradeSOL, volume24h: tokenData.volume24h || 0, time: new Date().toISOString() };
     await saveState();
 
-    const sig = await executeSwap(connection, wallet, quote);
+    // Retry with escalating priority fees on failure
+    let sig = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      sig = await executeSwap(connection, wallet, quote, attempt);
+      if (sig) break;
+      if (attempt < 3) {
+        log('Retrying buy (attempt ' + (attempt+1) + '/3) with higher priority fee...');
+        await new Promise(function(r){setTimeout(r, 2000);});
+      }
+    }
     if (!sig) {
       delete state.pendingBuys[tokenName];
       await saveState();
@@ -461,7 +480,16 @@ async function executeSell(connection, wallet, tokenName, pos, tokenData) {
     if (onChain < 0.000001) { delete state.positions[tokenName]; await saveState(); return; }
     const quote = await getSwapQuote(info.mint, SOL_MINT, Math.floor(onChain * Math.pow(10, info.decimals)));
     if (!quote) return;
-    const sig = await executeSwap(connection, wallet, quote);
+    // Retry with escalating priority fees on failure
+    let sig = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      sig = await executeSwap(connection, wallet, quote, attempt);
+      if (sig) break;
+      if (attempt < 3) {
+        log('Retrying sell (attempt ' + (attempt+1) + '/3) with higher priority fee...');
+        await new Promise(function(r){setTimeout(r, 2000);});
+      }
+    }
     if (!sig) return;
     const solReceived = parseFloat(quote.outAmount) / 1e9;
     const pnl = solReceived - pos.solSpent;
@@ -552,6 +580,7 @@ async function main() {
         if (onChain > 0.000001) {
           log('Pending buy confirmed: ' + name + ' (' + onChain.toFixed(4) + ' tokens) @ ' + pb.entryPrice.toFixed(8) + ' SOL — restoring with real entry price');
           state.positions[name] = { amount: onChain, entryPrice: pb.entryPrice, entryPriceUsd: pb.entryPriceUsd, peakPrice: pb.entryPrice, solSpent: pb.solSpent, openedAt: pb.time, entryVolume: pb.volume24h, zeroBalanceCount: 0 };
+          state.boughtMints[pb.mint] = name;  // re-whitelist on recovery
         } else {
           log('Pending buy for ' + name + ' not found on-chain — swap failed, clearing');
         }
@@ -564,6 +593,14 @@ async function main() {
   // SECURITY: Only recover positions for tokens the bot actually bought.
   // Airdropped or unknown tokens in the wallet are ignored completely.
   if (!state.boughtMints) state.boughtMints = {};
+  // Re-whitelist any positions already tracked in state (handles pre-whitelist positions like HANTA)
+  for (const [symbol, pos] of Object.entries(state.positions || {})) {
+    const info = state.watchlist[symbol];
+    if (info && info.mint && !state.boughtMints[info.mint]) {
+      state.boughtMints[info.mint] = symbol;
+      log('Re-whitelisted existing position: ' + symbol);
+    }
+  }
   log('Checking on-chain balances for bot-purchased positions...');
   for (const [mint, symbol] of Object.entries(state.boughtMints)) {
     if (state.positions[symbol]) continue;
