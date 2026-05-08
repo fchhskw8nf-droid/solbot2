@@ -10,7 +10,7 @@ const COINGECKO_API_KEY = process.env.COINGECKO_API_KEY || '';
 const STATE_FILE        = './bot2-state.json';
 
 const CONFIG = {
-  MAX_POSITIONS:      parseInt(process.env.MAX_POSITIONS    || '4'),
+  MAX_POSITIONS:      parseInt(process.env.MAX_POSITIONS    || '5'),
   TRADE_SIZE_SOL:     parseFloat(process.env.TRADE_SIZE_SOL || '0.2'),
   MIN_RESERVE_SOL:    parseFloat(process.env.MIN_RESERVE    || '0.05'),
   STOP_LOSS:          parseFloat(process.env.STOP_LOSS      || '0.25'),
@@ -552,8 +552,8 @@ async function bootstrapPriceHistory() {
       log('Bootstrap failed for ' + name + ': ' + e.message);
     }
   }
-  log('Bootstrap complete — 6 scan warmup before new buys enabled.');
-  warmupScansRemaining = 6;
+  log('Bootstrap complete — 3 scan warmup before new buys enabled.');
+  warmupScansRemaining = 3;
 }
 
 async function main() {
@@ -620,7 +620,7 @@ async function main() {
   let loopCount = 0;
   while (true) {
     try {
-      if (loopCount % 10 === 0) await scanForNewTokens();
+      if (loopCount % 3 === 0) await scanForNewTokens();  // every 3 min (was 10)
       loopCount++;
       await evaluateStrategy(connection, wallet);
     }
