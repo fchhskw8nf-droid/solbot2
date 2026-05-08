@@ -11,7 +11,7 @@ const STATE_FILE        = './bot2-state.json';
 
 const CONFIG = {
   MAX_POSITIONS:      parseInt(process.env.MAX_POSITIONS    || '5'),
-  TRADE_SIZE_SOL:     parseFloat(process.env.TRADE_SIZE_SOL || '0.2'),
+  TRADE_SIZE_SOL:     parseFloat(process.env.TRADE_SIZE_SOL || '0.15'),
   MIN_RESERVE_SOL:    parseFloat(process.env.MIN_RESERVE_SOL || '0.01'),
   STOP_LOSS:          parseFloat(process.env.STOP_LOSS      || '0.25'),
   BUY_THRESHOLD:      parseFloat(process.env.BUY_THRESHOLD  || '0.015'),
