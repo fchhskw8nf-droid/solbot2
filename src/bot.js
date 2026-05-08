@@ -25,11 +25,11 @@ const CONFIG = {
 
 // Auto-discovery config
 const DISC = {
-  MIN_VOLUME:    parseFloat(process.env.DISC_MIN_VOLUME    || '200000'),
-  MIN_CHANGE:    parseFloat(process.env.DISC_MIN_CHANGE    || '20'),
-  MIN_LIQUIDITY: parseFloat(process.env.DISC_MIN_LIQUIDITY || '30000'),
-  MAX_AGE_H:     parseFloat(process.env.DISC_MAX_AGE       || '72'),
-  MAX_TOKENS:    parseInt(process.env.DISC_MAX_TOKENS      || '3'),
+  MIN_VOLUME:    parseFloat(process.env.DISC_MIN_VOLUME    || '100000'),  // $100k 24h vol (was $200k)
+  MIN_CHANGE:    parseFloat(process.env.DISC_MIN_CHANGE    || '10'),      // up 10%+ (was 20%)
+  MIN_LIQUIDITY: parseFloat(process.env.DISC_MIN_LIQUIDITY || '20000'),   // $20k liquidity (was $30k)
+  MAX_AGE_H:     parseFloat(process.env.DISC_MAX_AGE       || '168'),     // up to 7 days old (was 72h)
+  MAX_TOKENS:    parseInt(process.env.DISC_MAX_TOKENS      || '5'),       // track up to 5 discovered (was 3)
 };
 
 const REDIS_URL   = process.env.UPSTASH_REDIS_REST_URL;
@@ -57,7 +57,6 @@ let state = {
 };
 
 let autoAddedTokens = {};
-let warmupScansRemaining = 0; // suppresses buys after bootstrap until real data blends in
 
 // ── Persistence ───────────────────────────────────────────────────────────────
 async function saveState() {
@@ -143,7 +142,7 @@ function getVolatility(token) {
 
 function buildMomentumScore(opts) {
   if (opts.volume24h < CONFIG.MIN_VOLUME_USD) return { score: 0, blocked: 'low volume ($' + Math.round(opts.volume24h/1000) + 'k)' };
-  if (opts.volatility < 0.001) return { score: 0, blocked: 'low volatility' };
+  if (opts.volatility < 0.005) return { score: 0, blocked: 'low volatility' };
   if (opts.momentum <= 0) return { score: 0, blocked: 'no momentum' };
   let score = opts.momentum * 0.5;
   if (opts.acceleration > 0.005) score *= 1.5;
@@ -158,44 +157,116 @@ function buildMomentumScore(opts) {
 async function scanForNewTokens() {
   try {
     log('Auto-discovery scan running...');
-    const res = await fetch('https://api.dexscreener.com/latest/dex/search?q=solana', { timeout: 15000 });
-    const data = await res.json();
-    if (!data.pairs) return;
     const now = Date.now();
+    const SKIP = new Set(['USDC','USDT','SOL','WSOL','BTC','ETH','WBTC','WETH','RAY','JUP','ORCA','MNGO','USDS','USDH','USDR']);
+    let allPairs = [];
+
+    // ── Source 1: DEX Screener trending (ranked by 6h trending score) ─────────
+    try {
+      const r1 = await fetch('https://api.dexscreener.com/latest/dex/search?q=solana&rankBy=trendingScoreH6&order=desc', { timeout: 12000 });
+      const d1 = await r1.json();
+      if (d1.pairs) { allPairs.push(...d1.pairs); }
+    } catch(e) { log('Discovery src1 failed: ' + e.message); }
+
+    // ── Source 2: Token boosts/trending ──────────────────────────────────────
+    try {
+      const r2 = await fetch('https://api.dexscreener.com/token-profiles/latest/v1', { timeout: 12000 });
+      const d2 = await r2.json();
+      const solTokens = (Array.isArray(d2) ? d2 : [])
+        .filter(t => t.chainId === 'solana')
+        .map(t => t.tokenAddress)
+        .filter(Boolean)
+        .slice(0, 15);
+      // Fetch pair data for top trending tokens
+      for (const mint of solTokens.slice(0, 8)) {
+        try {
+          const r = await fetch('https://api.dexscreener.com/latest/dex/tokens/' + mint, { timeout: 8000 });
+          const d = await r.json();
+          if (d.pairs) allPairs.push(...d.pairs);
+          await new Promise(res => setTimeout(res, 200));
+        } catch(e) {}
+      }
+    } catch(e) { log('Discovery src2 failed: ' + e.message); }
+
+    // ── Source 3: Pump.fun trending ───────────────────────────────────────────
+    try {
+      const r3 = await fetch('https://api.dexscreener.com/latest/dex/search?q=pump+solana&rankBy=volume&order=desc', { timeout: 12000 });
+      const d3 = await r3.json();
+      if (d3.pairs) allPairs.push(...d3.pairs);
+    } catch(e) { log('Discovery src3 failed: ' + e.message); }
+
+    if (allPairs.length === 0) { log('Discovery: no pairs returned from any source'); return; }
+
+    // ── Filter and score candidates ───────────────────────────────────────────
+    const seen = new Set();
     const candidates = [];
-    const SKIP = ['USDC','USDT','SOL','WSOL','BTC','ETH','WBTC','WETH'];
-    for (const pair of data.pairs) {
+
+    for (const pair of allPairs) {
       try {
         if (pair.chainId !== 'solana') continue;
         const symbol = (pair.baseToken && pair.baseToken.symbol || '').toUpperCase().replace(/[^A-Z0-9]/g,'');
-        const mint = pair.baseToken && pair.baseToken.address;
+        const mint   = pair.baseToken && pair.baseToken.address;
         if (!symbol || !mint || symbol.length > 12) continue;
+        if (seen.has(mint)) continue; seen.add(mint);
         if (state.watchlist[symbol] || autoAddedTokens[symbol]) continue;
-        if (SKIP.includes(symbol)) continue;
-        const volume24h = (pair.volume && pair.volume.h24) || 0;
-        const change24h = (pair.priceChange && pair.priceChange.h24) || 0;
-        const liquidity = (pair.liquidity && pair.liquidity.usd) || 0;
-        const ageH = (now - (pair.pairCreatedAt || 0)) / 3600000;
-        if (volume24h < DISC.MIN_VOLUME) continue;
-        if (change24h < DISC.MIN_CHANGE) continue;
-        if (liquidity < DISC.MIN_LIQUIDITY) continue;
-        if (ageH > DISC.MAX_AGE_H) continue;
-        candidates.push({ symbol, mint, volume24h, change24h, liquidity, ageH });
+        // Skip if already in watchlist by mint (different symbol same token)
+        const alreadyWatched = Object.values(state.watchlist).some(t => t.mint === mint);
+        if (alreadyWatched) continue;
+        if (SKIP.has(symbol)) continue;
+
+        const volume24h  = (pair.volume && pair.volume.h24)           || 0;
+        const volumeH6   = (pair.volume && pair.volume.h6)            || 0;
+        const change24h  = (pair.priceChange && pair.priceChange.h24) || 0;
+        const changeH6   = (pair.priceChange && pair.priceChange.h6)  || 0;
+        const liquidity  = (pair.liquidity && pair.liquidity.usd)     || 0;
+        const priceUsd   = parseFloat(pair.priceUsd || '0');
+
+        if (volume24h  < DISC.MIN_VOLUME)    continue;
+        if (liquidity  < DISC.MIN_LIQUIDITY) continue;
+        if (priceUsd   <= 0)                 continue;
+        // Use 6h change if available (more recent signal), fall back to 24h
+        const relevantChange = changeH6 !== 0 ? changeH6 : change24h;
+        if (relevantChange < DISC.MIN_CHANGE) continue;
+
+        // Age filter — only apply when pairCreatedAt is a real value
+        if (pair.pairCreatedAt && pair.pairCreatedAt > 1000000) {
+          const ageH = (now - pair.pairCreatedAt) / 3600000;
+          if (ageH > DISC.MAX_AGE_H) continue;
+        }
+
+        // Score: weight recent volume (6h) more than 24h for momentum detection
+        const score = (volumeH6 * 2 + volume24h) * (relevantChange / 100);
+        candidates.push({ symbol, mint, volume24h, volumeH6, change24h, changeH6: relevantChange, liquidity, priceUsd, score });
       } catch(e) {}
     }
-    candidates.sort((a,b) => (b.volume24h*b.change24h) - (a.volume24h*a.change24h));
+
+    candidates.sort((a, b) => b.score - a.score);
+    log('Discovery: ' + allPairs.length + ' pairs scanned, ' + candidates.length + ' candidates');
+
     const slots = DISC.MAX_TOKENS - Object.keys(autoAddedTokens).length;
-    const toAdd = candidates.slice(0, Math.min(slots, 2));
+    const toAdd = candidates.slice(0, Math.min(slots, 3));
+
     for (const t of toAdd) {
-      const msg = 'Auto-discovered: ' + t.symbol + ' +' + t.change24h.toFixed(1) + '% vol=$' + Math.round(t.volume24h/1000) + 'k liq=$' + Math.round(t.liquidity/1000) + 'k age=' + t.ageH.toFixed(1) + 'h';
-      log(msg);
+      log('Auto-discovered: ' + t.symbol +
+        ' 6h=' + (t.changeH6 >= 0 ? '+' : '') + t.changeH6.toFixed(1) + '%' +
+        ' 24h=' + (t.change24h >= 0 ? '+' : '') + t.change24h.toFixed(1) + '%' +
+        ' vol=$' + Math.round(t.volume24h/1000) + 'k' +
+        ' liq=$' + Math.round(t.liquidity/1000) + 'k' +
+        ' $' + t.priceUsd.toFixed(6));
       state.watchlist[t.symbol] = { mint: t.mint, decimals: 6, cgId: null };
       autoAddedTokens[t.symbol] = { addedAt: now, mint: t.mint };
       if (!state.autoDiscovered) state.autoDiscovered = [];
-      state.autoDiscovered.unshift({ symbol: t.symbol, time: new Date().toISOString(), change24h: t.change24h, volume24h: t.volume24h });
+      state.autoDiscovered.unshift({ symbol: t.symbol, time: new Date().toISOString(), change24h: t.change24h, changeH6: t.changeH6, volume24h: t.volume24h });
       if (state.autoDiscovered.length > 20) state.autoDiscovered.pop();
     }
-    if (toAdd.length > 0) { log('Added to watchlist: ' + toAdd.map(t=>t.symbol).join(', ')); await saveState(); }
+
+    if (toAdd.length > 0) {
+      log('Added to watchlist: ' + toAdd.map(t => t.symbol).join(', '));
+      await saveState();
+    } else {
+      log('Discovery: no new tokens met criteria (min vol=$' + Math.round(DISC.MIN_VOLUME/1000) + 'k change=+' + DISC.MIN_CHANGE + '% liq=$' + Math.round(DISC.MIN_LIQUIDITY/1000) + 'k)');
+    }
+
     // Remove stale auto tokens (no position after 24h)
     for (const [sym, info] of Object.entries(autoAddedTokens)) {
       if ((now - info.addedAt) / 3600000 > 24 && !state.positions[sym]) {
@@ -205,7 +276,7 @@ async function scanForNewTokens() {
         await saveState();
       }
     }
-  } catch(e) { log('Discovery error: ' + e.message); }
+  } catch(e) { log('Discovery error: ' + e.message); addError('Discovery: ' + e.message); }
 }
 
 // ── Solana Helpers ────────────────────────────────────────────────────────────
@@ -296,17 +367,13 @@ async function evaluateStrategy(connection, wallet) {
           }
         } catch(e) {}
       }
-      if (!tokenUsd || volume24h === 0) {
+      if (!tokenUsd && info.mint) {
         try {
           const dsRes = await fetch('https://api.dexscreener.com/latest/dex/tokens/' + info.mint, { timeout: 10000 });
           const dsData = await dsRes.json();
           if (dsData.pairs && dsData.pairs.length > 0) {
             const pair = dsData.pairs.sort((a,b) => ((b.liquidity&&b.liquidity.usd)||0) - ((a.liquidity&&a.liquidity.usd)||0))[0];
-            if (pair.priceUsd) {
-              if (!tokenUsd) tokenUsd = parseFloat(pair.priceUsd);
-              if (volume24h === 0) volume24h = (pair.volume&&pair.volume.h24)||0;
-              if (change24h === 0) change24h = (pair.priceChange&&pair.priceChange.h24)||0;
-            }
+            if (pair.priceUsd) { tokenUsd = parseFloat(pair.priceUsd); volume24h = (pair.volume&&pair.volume.h24)||0; change24h = (pair.priceChange&&pair.priceChange.h24)||0; }
           }
         } catch(e) {}
       }
@@ -372,10 +439,7 @@ async function evaluateStrategy(connection, wallet) {
 
   const openCount = Object.keys(state.positions).length;
   const availableSlots = CONFIG.MAX_POSITIONS - openCount;
-  if (warmupScansRemaining > 0) {
-    warmupScansRemaining--;
-    log('Warmup: ' + warmupScansRemaining + ' scans remaining before buys enabled (letting price history stabilize)');
-  } else if (availableSlots > 0 && state.currentSol > CONFIG.MIN_RESERVE_SOL + CONFIG.TRADE_SIZE_SOL) {
+  if (availableSlots > 0 && state.currentSol > CONFIG.MIN_RESERVE_SOL + CONFIG.TRADE_SIZE_SOL) {
     const candidates = Object.entries(tokenData).filter(([n,d]) => !state.positions[n] && !d.blocked && d.score >= CONFIG.BUY_THRESHOLD).sort((a,b) => b[1].score - a[1].score).slice(0, availableSlots);
     if (candidates.length > 0) { for (const [n,d] of candidates) { if (state.currentSol < CONFIG.MIN_RESERVE_SOL + CONFIG.TRADE_SIZE_SOL) break; log('BUY ' + n + ' score=' + d.score.toFixed(5)); await executeBuy(connection, wallet, n, d); } }
     else log('No momentum signals. Watching...');
@@ -429,60 +493,6 @@ async function executeSell(connection, wallet, tokenName, pos, tokenData) {
   } catch(e) { log('Sell failed: ' + e.message); addError(e.message); }
 }
 
-
-// ── Bootstrap Price History ───────────────────────────────────────────────────
-async function bootstrapPriceHistory() {
-  log('Bootstrapping price history...');
-  let solUsd = 150;
-  try {
-    const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd', { timeout: 10000 });
-    const d = await r.json();
-    if (d.solana && d.solana.usd) solUsd = d.solana.usd;
-  } catch(e) {}
-
-  const tokens = Object.keys(state.watchlist);
-  for (let i = 0; i < tokens.length; i++) {
-    const name = tokens[i];
-    const info = state.watchlist[name];
-    if (!info || !info.mint) continue;
-    try {
-      const res = await fetch('https://api.dexscreener.com/latest/dex/tokens/' + info.mint, { timeout: 12000 });
-      const data = await res.json();
-      if (!data.pairs || data.pairs.length === 0) continue;
-      const pair = data.pairs.sort(function(a,b){
-        return ((b.liquidity&&b.liquidity.usd)||0) - ((a.liquidity&&a.liquidity.usd)||0);
-      })[0];
-      const curUsd = parseFloat(pair.priceUsd || '0');
-      if (!curUsd) continue;
-      const change24h = (pair.priceChange && pair.priceChange.h24) || 0;
-      const change6h  = (pair.priceChange && pair.priceChange.h6)  || change24h / 4;
-      // Synthesize 20 price points: spread evenly, keeping current price as LAST point
-      // Use 6h change for the recent half to avoid inflating momentum
-      const price24hAgo = curUsd / (1 + change24h / 100);
-      const price6hAgo  = curUsd / (1 + change6h  / 100);
-      state.priceHistory[name] = [];
-      const now = Date.now();
-      for (let j = 0; j < 15; j++) {
-        const t = j / 14;
-        const synthUsd = price24hAgo + (price6hAgo - price24hAgo) * t;
-        state.priceHistory[name].push({ price: synthUsd / solUsd, time: now - (19 - j) * 7200000 });
-      }
-      // Last 5 points: 6h ago → now (tighter window = realistic recent momentum)
-      for (let j = 0; j < 5; j++) {
-        const t = j / 4;
-        const synthUsd = price6hAgo + (curUsd - price6hAgo) * t;
-        state.priceHistory[name].push({ price: synthUsd / solUsd, time: now - (4 - j) * 3600000 });
-      }
-      log('Bootstrap ' + name + ': 20 pts, mom=' + (getMomentum(name)*100).toFixed(2) + '% vol=' + (getVolatility(name)*100).toFixed(3) + '%');
-      if (i < tokens.length - 1) await new Promise(r => setTimeout(r, 600));
-    } catch(e) {
-      log('Bootstrap failed for ' + name + ': ' + e.message);
-    }
-  }
-  log('Bootstrap complete — 6 scan warmup before new buys enabled.');
-  warmupScansRemaining = 6;
-}
-
 async function main() {
   if (!PRIVATE_KEY) { console.error('PRIVATE_KEY not set'); process.exit(1); }
   await loadState();
@@ -511,7 +521,6 @@ async function main() {
   }
   log('Positions after startup scan: ' + Object.keys(state.positions).join(', ') || 'none');
   await saveState();
-  await bootstrapPriceHistory();
   let loopCount = 0;
   while (true) {
     try {
