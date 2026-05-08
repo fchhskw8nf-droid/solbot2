@@ -12,7 +12,7 @@ const STATE_FILE        = './bot2-state.json';
 const CONFIG = {
   MAX_POSITIONS:      parseInt(process.env.MAX_POSITIONS    || '5'),
   TRADE_SIZE_SOL:     parseFloat(process.env.TRADE_SIZE_SOL || '0.2'),
-  MIN_RESERVE_SOL:    parseFloat(process.env.MIN_RESERVE    || '0.05'),
+  MIN_RESERVE_SOL:    parseFloat(process.env.MIN_RESERVE_SOL || '0.01'),
   STOP_LOSS:          parseFloat(process.env.STOP_LOSS      || '0.25'),
   BUY_THRESHOLD:      parseFloat(process.env.BUY_THRESHOLD  || '0.015'),
   SCAN_INTERVAL_MS:   parseInt(process.env.SCAN_INTERVAL_MS || '60000'),
@@ -191,16 +191,39 @@ async function scanForNewTokens() {
       const msg = 'Auto-discovered: ' + t.symbol + ' +' + t.change24h.toFixed(1) + '% vol=$' + Math.round(t.volume24h/1000) + 'k liq=$' + Math.round(t.liquidity/1000) + 'k age=' + t.ageH.toFixed(1) + 'h';
       log(msg);
       state.watchlist[t.symbol] = { mint: t.mint, decimals: 6, cgId: null };
-      autoAddedTokens[t.symbol] = { addedAt: now, mint: t.mint };
+      autoAddedTokens[t.symbol] = { addedAt: now, mint: t.mint, addedPrice: t.priceUsd };
       if (!state.autoDiscovered) state.autoDiscovered = [];
       state.autoDiscovered.unshift({ symbol: t.symbol, time: new Date().toISOString(), change24h: t.change24h, volume24h: t.volume24h });
       if (state.autoDiscovered.length > 20) state.autoDiscovered.pop();
     }
     if (toAdd.length > 0) { log('Added to watchlist: ' + toAdd.map(t=>t.symbol).join(', ')); await saveState(); }
-    // Remove stale auto tokens (no position after 24h)
+    // Remove stale or dead auto-discovered tokens
+    // Never remove default watchlist tokens
+    const DEFAULT_TOKENS = new Set(['POPCAT','FARTCOIN','MEW','PENGU','BONK','WIF','TROLL','LIMINAL']);
     for (const [sym, info] of Object.entries(autoAddedTokens)) {
-      if ((now - info.addedAt) / 3600000 > 24 && !state.positions[sym]) {
-        log('Removing stale auto-token: ' + sym);
+      if (DEFAULT_TOKENS.has(sym)) continue;
+      const ageH = (now - info.addedAt) / 3600000;
+      let removeReason = null;
+
+      // Stale: no position after 24h
+      if (ageH > 24 && !state.positions[sym]) {
+        removeReason = 'stale (24h, no position)';
+      }
+
+      // Dead: price dropped 80%+ from discovery price after at least 2h
+      if (!removeReason && ageH > 2 && info.addedPrice > 0 && !state.positions[sym]) {
+        const sigData = state.signals && state.signals[sym];
+        const curPrice = sigData && sigData.priceUsd ? sigData.priceUsd : 0;
+        if (curPrice > 0) {
+          const drop = (info.addedPrice - curPrice) / info.addedPrice;
+          if (drop >= 0.80) {
+            removeReason = 'dead (-' + (drop*100).toFixed(0) + '% from $' + info.addedPrice.toFixed(6) + ')';
+          }
+        }
+      }
+
+      if (removeReason) {
+        log('Removing auto-token ' + sym + ': ' + removeReason);
         delete state.watchlist[sym];
         delete autoAddedTokens[sym];
         await saveState();
