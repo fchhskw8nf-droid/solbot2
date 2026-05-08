@@ -18,8 +18,8 @@ const CONFIG = {
   SCAN_INTERVAL_MS:   parseInt(process.env.SCAN_INTERVAL_MS || '60000'),
   MOMENTUM_EXIT:      parseFloat(process.env.MOMENTUM_EXIT  || '-0.005'),
   MIN_VOLUME_USD:     parseFloat(process.env.MIN_VOLUME_USD || '50000'),
-  TRAILING_ARM_PCT:   parseFloat(process.env.TRAILING_ARM   || '0.10'),  // trailing stop 10%
-  MIN_HOLD_MS:        parseInt(process.env.MIN_HOLD_MS      || String(4 * 60 * 60 * 1000)),
+  TRAILING_ARM_PCT:   parseFloat(process.env.TRAILING_ARM   || '0.20'),  // trailing stop 20% (was 10%)
+  MIN_HOLD_MS:        parseInt(process.env.MIN_HOLD_MS      || String(30 * 60 * 1000)),  // 30 min (was 4h)
   VOL_DROP_THRESHOLD: parseFloat(process.env.VOL_DROP_THRESHOLD || '0.30'), // exit when volume drops 30% from entry
 };
 
