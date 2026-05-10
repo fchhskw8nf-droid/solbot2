@@ -17,19 +17,21 @@ const CONFIG = {
   BUY_THRESHOLD:      parseFloat(process.env.BUY_THRESHOLD  || '0.015'),
   SCAN_INTERVAL_MS:   parseInt(process.env.SCAN_INTERVAL_MS || '60000'),
   MOMENTUM_EXIT:      parseFloat(process.env.MOMENTUM_EXIT  || '-0.005'),
-  MIN_VOLUME_USD:     parseFloat(process.env.MIN_VOLUME_USD || '50000'),
-  TRAILING_ARM_PCT:   parseFloat(process.env.TRAILING_ARM   || '0.15'),  // trailing stop 15%
-  MIN_HOLD_MS:        parseInt(process.env.MIN_HOLD_MS      || String(60 * 60 * 1000)),  // 60 min
+  MIN_VOLUME_USD:     parseFloat(process.env.MIN_VOLUME_USD     || '50000'),
+  MIN_MARKET_CAP_USD: parseFloat(process.env.MIN_MARKET_CAP_USD || '500000'), // $500k min market cap to buy
+  TRAILING_ARM_PCT:   parseFloat(process.env.TRAILING_ARM   || '0.10'),  // trailing stop 10%
+  MIN_HOLD_MS:        parseInt(process.env.MIN_HOLD_MS      || String(5 * 60 * 1000)),   // 5 min
   VOL_DROP_THRESHOLD: parseFloat(process.env.VOL_DROP_THRESHOLD || '0.30'), // exit when volume drops 30% from entry
 };
 
 // Auto-discovery config
 const DISC = {
-  MIN_VOLUME:    parseFloat(process.env.DISC_MIN_VOLUME    || '200000'),
-  MIN_CHANGE:    parseFloat(process.env.DISC_MIN_CHANGE    || '20'),
-  MIN_LIQUIDITY: parseFloat(process.env.DISC_MIN_LIQUIDITY || '30000'),
-  MAX_AGE_H:     parseFloat(process.env.DISC_MAX_AGE       || '72'),
-  MAX_TOKENS:    parseInt(process.env.DISC_MAX_TOKENS      || '3'),
+  MIN_VOLUME:     parseFloat(process.env.DISC_MIN_VOLUME     || '200000'),
+  MIN_CHANGE:     parseFloat(process.env.DISC_MIN_CHANGE     || '20'),
+  MIN_LIQUIDITY:  parseFloat(process.env.DISC_MIN_LIQUIDITY  || '30000'),
+  MIN_MARKET_CAP: parseFloat(process.env.DISC_MIN_MARKET_CAP || '500000'), // $500k min market cap
+  MAX_AGE_H:      parseFloat(process.env.DISC_MAX_AGE        || '72'),
+  MAX_TOKENS:     parseInt(process.env.DISC_MAX_TOKENS       || '3'),
 };
 
 const REDIS_URL   = process.env.UPSTASH_REDIS_REST_URL;
@@ -144,6 +146,7 @@ function getVolatility(token) {
 
 function buildMomentumScore(opts) {
   if (opts.volume24h < CONFIG.MIN_VOLUME_USD) return { score: 0, blocked: 'low volume ($' + Math.round(opts.volume24h/1000) + 'k)' };
+  if (opts.marketCapUsd > 0 && opts.marketCapUsd < CONFIG.MIN_MARKET_CAP_USD) return { score: 0, blocked: 'low mcap ($' + Math.round(opts.marketCapUsd/1000) + 'k)' };
   if (opts.volatility < 0.005) return { score: 0, blocked: 'low volatility' };
   if (opts.momentum <= 0) return { score: 0, blocked: 'no momentum' };
   let score = opts.momentum * 0.5;
@@ -177,10 +180,14 @@ async function scanForNewTokens() {
         const change24h = (pair.priceChange && pair.priceChange.h24) || 0;
         const liquidity = (pair.liquidity && pair.liquidity.usd) || 0;
         const ageH = (now - (pair.pairCreatedAt || 0)) / 3600000;
-        if (volume24h < DISC.MIN_VOLUME) continue;
-        if (change24h < DISC.MIN_CHANGE) continue;
+        const marketCap = (pair.marketCap) || (pair.fdv) || 0;
+        if (volume24h < DISC.MIN_VOLUME)    continue;
+        if (change24h < DISC.MIN_CHANGE)    continue;
         if (liquidity < DISC.MIN_LIQUIDITY) continue;
-        if (ageH > DISC.MAX_AGE_H) continue;
+        if (ageH > DISC.MAX_AGE_H)          continue;
+        if (marketCap > 0 && marketCap < DISC.MIN_MARKET_CAP) {
+          continue; // reject micro-cap rugs (< $500k market cap)
+        }
         candidates.push({ symbol, mint, volume24h, change24h, liquidity, ageH });
       } catch(e) {}
     }
@@ -350,7 +357,7 @@ async function evaluateStrategy(connection, wallet) {
     if (!info) continue;
     try {
       const cgHeaders = COINGECKO_API_KEY ? { 'x-cg-demo-api-key': COINGECKO_API_KEY } : {};
-      let tokenUsd = null, solUsd = globalSolUsd, volume24h = 0, change24h = 0, sentimentScore = null;
+      let tokenUsd = null, solUsd = globalSolUsd, volume24h = 0, change24h = 0, sentimentScore = null, marketCapUsd = 0;
       if (info.cgId) {
         try {
           const priceRes = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=' + info.cgId + ',solana&vs_currencies=usd', { timeout: 10000, headers: cgHeaders });
@@ -367,7 +374,12 @@ async function evaluateStrategy(connection, wallet) {
           const dsData = await dsRes.json();
           if (dsData.pairs && dsData.pairs.length > 0) {
             const pair = dsData.pairs.sort((a,b) => ((b.liquidity&&b.liquidity.usd)||0) - ((a.liquidity&&a.liquidity.usd)||0))[0];
-            if (pair.priceUsd) { tokenUsd = parseFloat(pair.priceUsd); volume24h = (pair.volume&&pair.volume.h24)||0; change24h = (pair.priceChange&&pair.priceChange.h24)||0; }
+            if (pair.priceUsd) {
+              tokenUsd    = parseFloat(pair.priceUsd);
+              volume24h   = (pair.volume&&pair.volume.h24)||0;
+              change24h   = (pair.priceChange&&pair.priceChange.h24)||0;
+              marketCapUsd = pair.marketCap || pair.fdv || 0;
+            }
           }
         } catch(e) {}
       }
@@ -399,7 +411,7 @@ async function evaluateStrategy(connection, wallet) {
 
   state.signals = {};
   Object.entries(tokenData).forEach(([k,v]) => {
-    state.signals[k] = { price: v.priceSol, priceUsd: v.tokenUsd, momentum: v.momentum, acceleration: v.acceleration, volatility: v.volatility, volume24h: v.volume24h, change24h: v.change24h, compositeScore: v.score, blocked: v.blocked };
+    state.signals[k] = { price: v.priceSol, priceUsd: v.tokenUsd, marketCapUsd: v.marketCapUsd, momentum: v.momentum, acceleration: v.acceleration, volatility: v.volatility, volume24h: v.volume24h, change24h: v.change24h, compositeScore: v.score, blocked: v.blocked };
   });
 
   for (const [token, pos] of Object.entries(state.positions)) {
