@@ -86,8 +86,9 @@ async function loadState() {
         let parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
         if (typeof parsed === 'string') parsed = JSON.parse(parsed);
         state = { ...state, ...parsed };
-        state.watchlist = Object.assign({}, state.watchlist);
-        log('State loaded from Redis'); return;
+        // Always ensure default tokens are in watchlist — never let Redis wipe them
+        state.watchlist = Object.assign({}, DEFAULT_TOKENS, state.watchlist);
+        log('State loaded from Redis — ' + Object.keys(state.watchlist).length + ' tokens in watchlist'); return;
       }
     } catch(e) { log('Redis load failed: ' + e.message); }
   }
